@@ -11,6 +11,7 @@ python -m unittest discover -s tests -v
 bash -n install.sh run.sh
 python tools/checksums.py
 python tools/checksums.py --check
+python tools/check_public_files.py
 git diff --check
 ```
 
