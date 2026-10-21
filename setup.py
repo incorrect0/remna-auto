@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = '1.1.0'
+VERSION = '1.1.1'
 HERE = Path(__file__).resolve().parent
 ROOT = Path('/opt/remna-auto')
 STACK = Path('/opt/remnanode')
@@ -388,21 +388,55 @@ def owned_node_pids():
     return set(re.findall(r'^\s*(\d+)\s*$', top.stdout, re.M))
 
 
+def geo_lookup(ip, provider):
+    """Executed in a short-lived process so DNS/slow responses cannot stall setup."""
+    ip = str(ipaddress.IPv4Address(ip))
+    url = (f'https://ipwho.is/{ip}?fields=ip,success,country_code,country'
+           if provider == 'ipwho' else f'https://ipapi.co/{ip}/json/')
+    opener = urllib.request.build_opener(NoRedirect(), urllib.request.ProxyHandler({}))
+    request = urllib.request.Request(url, headers={'Accept': 'application/json'})
+    with opener.open(request, timeout=2) as response:
+        body = response.read(32769)
+    if len(body) > 32768:
+        raise ValueError('GeoIP response too large')
+    data = json.loads(body)
+    code = data.get('country_code', '')
+    name = data.get('country', '') if provider == 'ipwho' else data.get('country_name', '')
+    if data.get('error') or data.get('ip') != ip or (provider == 'ipwho' and data.get('success') is not True):
+        raise ValueError('Invalid GeoIP response')
+    if not isinstance(code, str) or not isinstance(name, str):
+        raise ValueError('Invalid country types')
+    if not re.fullmatch('[A-Z]{2}', code) or not re.fullmatch(r"[A-Za-z][A-Za-z ()'.,-]{1,60}", name):
+        raise ValueError('Invalid country')
+    return code, name
+
+
 def country_for_ipv4(address):
     try:
-        ip = ipaddress.IPv4Address(address)
-        opener = urllib.request.build_opener(NoRedirect(), urllib.request.ProxyHandler({}))
-        with opener.open(f'https://ipapi.co/{ip}/json/', timeout=8) as response:
-            data = json.loads(response.read(32769))
-        code, name = data.get('country_code', ''), data.get('country_name', '')
-        if data.get('error') or data.get('ip') != str(ip):
-            raise ValueError()
-        if not re.fullmatch('[A-Z]{2}', code) or not re.fullmatch(r"[A-Za-z][A-Za-z ()'.,-]{1,60}", name):
-            raise ValueError()
-        return code, name
-    except (SetupError, OSError, ValueError, TypeError, AttributeError):
-        log('Внимание: страна по IPv4 не определена; используется XX / auto-install.')
+        ip = str(ipaddress.IPv4Address(address))
+    except (ValueError, TypeError):
         return 'XX', 'auto-install'
+    deadline = time.monotonic() + 6
+    worker = ("import runpy,sys,json; m=runpy.run_path(sys.argv[1]); "
+              "print(json.dumps(m['geo_lookup'](sys.argv[2],sys.argv[3])))")
+    for provider in ('ipwho', 'ipapi'):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            result = subprocess.run([sys.executable, '-c', worker, str(HERE / 'setup.py'), ip, provider],
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    text=True, timeout=min(3, remaining), check=True)
+            code, name = json.loads(result.stdout)
+            if not isinstance(code, str) or not isinstance(name, str):
+                raise ValueError()
+            if not re.fullmatch('[A-Z]{2}', code) or not re.fullmatch(r"[A-Za-z][A-Za-z ()'.,-]{1,60}", name):
+                raise ValueError()
+            return code, name
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+            continue
+    log('Внимание: GeoIP недоступен; установка продолжается с XX / auto-install.')
+    return 'XX', 'auto-install'
 
 
 def automatic_name(base, nodes, own_uuid=None):
