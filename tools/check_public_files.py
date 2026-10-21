@@ -14,7 +14,7 @@ if (ROOT/'.git').exists():
     extra = set(tracked) - allowed
     if extra:
         raise SystemExit('Не разрешены к публикации: '+', '.join(sorted(extra)))
-hosts = {'ipapi.co','github.com','raw.githubusercontent.com','codeload.github.com','docs.rw',
+hosts = {'ipwho.is','ipapi.co','github.com','raw.githubusercontent.com','codeload.github.com','docs.rw',
          'download.docker.com','dl.cloudsmith.io','archive.ubuntu.com','security.ubuntu.com',
          'ports.ubuntu.com','deb.debian.org','security.debian.org','www.w3.org'}
 docs_networks = [ipaddress.ip_network(n) for n in ('192.0.2.0/24','198.51.100.0/24','203.0.113.0/24','127.0.0.0/8')]
