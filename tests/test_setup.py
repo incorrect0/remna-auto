@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch, Mock, PropertyMock
@@ -90,10 +91,23 @@ class ValidationTests(unittest.TestCase):
                                                 'country_name': 'Germany'}).encode()
         opener = Mock();opener.open.return_value = response
         with patch.object(s.urllib.request, 'build_opener', return_value=opener):
-            self.assertEqual(s.country_for_ipv4('203.0.113.12'), ('DE', 'Germany'))
-        opener.open.side_effect = OSError('offline')
-        with patch.object(s.urllib.request, 'build_opener', return_value=opener):
+            self.assertEqual(s.geo_lookup('203.0.113.12', 'ipapi'), ('DE', 'Germany'))
+        with patch.object(s.subprocess, 'run', side_effect=subprocess.TimeoutExpired('geo', 3)) as calls:
             self.assertEqual(s.country_for_ipv4('203.0.113.12'), ('XX', 'auto-install'))
+            self.assertEqual(calls.call_count, 2)
+            self.assertTrue(all(call.kwargs['timeout'] <= 3 for call in calls.call_args_list))
+
+    def test_geo_fallback_provider(self):
+        with patch.object(s.subprocess, 'run', side_effect=[OSError('offline'),
+                Mock(stdout='["DE", "Germany"]')]) as calls:
+            self.assertEqual(s.country_for_ipv4('203.0.113.12'), ('DE', 'Germany'))
+            self.assertEqual(calls.call_count, 2)
+
+    def test_geo_global_deadline(self):
+        with patch.object(s.time, 'monotonic', side_effect=[0, 0, 7]), \
+             patch.object(s.subprocess, 'run', side_effect=subprocess.TimeoutExpired('geo', 3)) as calls:
+            self.assertEqual(s.country_for_ipv4('203.0.113.12'), ('XX', 'auto-install'))
+            self.assertEqual(calls.call_count, 1)
 
     def test_auto_inbounds_skip_reserved_and_duplicate_ports(self):
         api = FakeAPI();c = config();c['inbound_uuids'] = []
