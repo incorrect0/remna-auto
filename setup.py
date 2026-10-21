@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = '1.0.1'
+VERSION = '1.0.2'
 HERE = Path(__file__).resolve().parent
 ROOT = Path('/opt/remna-auto')
 STACK = Path('/opt/remnanode')
@@ -167,9 +167,7 @@ def validate_config(cfg):
     except ValueError:
         address = validate_domain(address)
     cfg['node_address'] = address
-    cfg['node_port'] = validate_port(cfg.get('node_port', 3001))
-    if cfg['node_port'] in (22, 80, 443):
-        raise SetupError('Порт управления ноды не должен совпадать с SSH/HTTP/HTTPS.')
+    cfg['node_port'] = 3001
     name = cfg.get('node_name', '')
     if not isinstance(name, str) or not 3 <= len(name) <= 30 or any(ord(c) < 32 for c in name):
         raise SetupError('Имя ноды: 3–30 символов без управляющих символов.')
@@ -177,17 +175,7 @@ def validate_config(cfg):
     if not re.fullmatch('[A-Z]{2}', country):
         raise SetupError('Код страны: две латинские буквы, например DE или XX.')
     cfg['country_code'] = country
-    ips = cfg.get('panel_ips', [])
-    if isinstance(ips, str):
-        ips = [x.strip() for x in ips.split(',') if x.strip()]
-    try:
-        if not isinstance(ips, list) or any(not isinstance(x, str) or '%' in x for x in ips):
-            raise ValueError()
-        cfg['panel_ips'] = sorted({str(ipaddress.ip_address(x)) for x in ips})
-    except ValueError:
-        raise SetupError('panel_ips: только отдельные IPv4/IPv6 сервера панели, без доменов и подсетей.') from None
-    if not cfg['panel_ips']:
-        raise SetupError('Нужен хотя бы один исходящий IP сервера панели для защиты порта управления.')
+    cfg.pop('panel_ips', None)
     image = cfg.get('node_image', 'remnawave/node:latest')
     if not re.fullmatch(r'(?:ghcr.io/)?remnawave/node(?::[A-Za-z0-9_.-]+|@sha256:[a-f0-9]{64})', image):
         raise SetupError('Допускается официальный образ remnawave/node или ghcr.io/remnawave/node.')
@@ -286,18 +274,22 @@ def validate_inbound(raw, cfg):
     reserved = {22, 80, 443, cfg['node_port']}
     if ports & reserved:
         raise SetupError(f"Inbound {raw.get('tag')} занимает {sorted(ports & reserved)}. "
-                         '443 занят Caddy, 3001/выбранный node_port — API ноды; выберите другой inbound/профиль.')
+                         '443 занят Caddy, 3001 — API ноды; выберите другой inbound/профиль.')
     stream = raw.get('streamSettings', {})
     if stream.get('security') == 'reality':
         reality = stream.get('realitySettings', {})
         target = reality.get('target', reality.get('dest'))
-        if target not in ('127.0.0.1:443', 'localhost:443', '[::1]:443', cfg['domain'] + ':443'):
-            raise SetupError(f"REALITY {raw.get('tag')}: для этого Selfsteal нужен target 127.0.0.1:443. "
-                             'Общий профиль автоматически не изменяется.')
-        if cfg['domain'] not in reality.get('serverNames', []):
-            raise SetupError('Домен Caddy отсутствует в serverNames выбранного REALITY-профиля.')
-        if reality.get('xver', 0) != 0:
-            raise SetupError('Для обычного Caddy нужен REALITY xver: 0 (без PROXY protocol).')
+        local_targets = ('127.0.0.1:443', 'localhost:443', '[::1]:443', cfg['domain'] + ':443')
+        if target in local_targets:
+            if cfg['domain'] not in reality.get('serverNames', []):
+                raise SetupError('Для локального Selfsteal добавьте домен Caddy в serverNames выбранного профиля.')
+            if reality.get('xver', 0) != 0:
+                raise SetupError('Для обычного Caddy нужен REALITY xver: 0 (без PROXY protocol).')
+        elif target:
+            log(f"Внимание: REALITY {raw.get('tag')} использует внешний target; "
+                'профиль сохранён без изменений, локальный Caddy не используется этим inbound как Selfsteal.')
+        else:
+            raise SetupError('В REALITY не задан target/dest. Исправьте выбранный профиль.')
     return ports
 
 
@@ -315,6 +307,23 @@ def resolve(host):
 def local_ips():
     raw = json.loads(run(['ip', '-j', 'addr']).stdout)
     return {a['local'] for nic in raw for a in nic.get('addr_info', [])}
+
+
+def detect_ipv4(domain):
+    """Use this host's public IPv4; DNS can identify a public NAT address."""
+    addresses = local_ips()
+    public = sorted(ip for ip in addresses
+                    if ipaddress.ip_address(ip).version == 4 and ipaddress.ip_address(ip).is_global)
+    dns = sorted(ip for ip in resolve(validate_domain(domain))
+                 if ipaddress.ip_address(ip).version == 4 and ipaddress.ip_address(ip).is_global)
+    matching = sorted(set(public) & set(dns))
+    if matching:
+        return matching[0]
+    if len(public) == 1:
+        return public[0]
+    if len(dns) == 1:
+        return dns[0]
+    raise SetupError('Не удалось однозначно определить IPv4 ноды. Настройте одну A-запись домена на этот сервер.')
 
 
 def check_dns(cfg):
@@ -389,19 +398,9 @@ def list_nodes(api):
     return result
 
 
-def nft_config(cfg):
-    lines = ['table inet remna_auto {', ' chain node_api {',
-             '  type filter hook input priority -5; policy accept;', '  iifname "lo" accept']
-    for ip in cfg['panel_ips']:
-        family = 'ip6' if ':' in ip else 'ip'
-        lines.append(f"  {family} saddr {ip} tcp dport {cfg['node_port']} accept")
-    lines += [f"  tcp dport {cfg['node_port']} drop", ' }', '}', '']
-    return '\n'.join(lines)
-
-
 def install_dependencies():
     global APT_SOURCE_FILE
-    log('Установка Docker Engine, Compose, Caddy и nftables…')
+    log('Установка Docker Engine, Compose и Caddy…')
     os_release = {}
     for line in Path('/etc/os-release').read_text().splitlines():
         if '=' in line:
@@ -439,7 +438,7 @@ def install_dependencies():
     refresh_sources()
     log('Для установки используются отдельные официальные HTTPS-источники APT; репозитории провайдера не изменяются.')
     run(['apt-get', 'update'])
-    run(['apt-get', 'install', '-y', 'ca-certificates', 'curl', 'gnupg', 'nftables', 'iproute2', 'logrotate'])
+    run(['apt-get', 'install', '-y', 'ca-certificates', 'curl', 'gnupg', 'iproute2', 'logrotate'])
     if not shutil.which('docker'):
         key = run(['curl', '-fsSL', '--retry', '3', f'https://download.docker.com/linux/{distro}/gpg']).stdout
         Path('/etc/apt/keyrings').mkdir(parents=True, exist_ok=True)
@@ -476,6 +475,7 @@ class Transaction:
                      'previous_state': state, 'new_node_uuid': None, 'previous_node': None,
                      'caddy_was_active': run(['systemctl', 'is-active', 'caddy'], check=False).returncode == 0,
                      'caddy_was_enabled': run(['systemctl', 'is-enabled', 'caddy'], check=False).returncode == 0,
+                     'firewall_was_enabled': run(['systemctl', 'is-enabled', 'remna-auto-firewall'], check=False).returncode == 0,
                      'firewall_was_active': run(['systemctl', 'is-active', 'remna-auto-firewall'], check=False).returncode == 0}
         self.save()
 
@@ -527,18 +527,16 @@ def prepare_local(cfg, secret, tx):
     run(['systemctl', 'enable', 'caddy'])
     run(['systemctl', 'reload-or-restart', 'caddy'])
 
-    # Dedicated nft table affects only this node's management port, never SSH or global rules.
-    tx.write(NFT, nft_config(cfg))
-    run(['nft', '--check', '-f', NFT])
-    unit = ('[Unit]\nDescription=Remna Auto node API access control\nAfter=network-pre.target\n'
-            'Before=docker.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\n'
-            'ExecStartPre=-/usr/sbin/nft delete table inet remna_auto\n'
-            f'ExecStart=/usr/sbin/nft -f {NFT}\n'
-            'ExecStop=-/usr/sbin/nft delete table inet remna_auto\n\n[Install]\nWantedBy=multi-user.target\n')
-    tx.write(SERVICE, unit, 0o644)
-    run(['systemctl', 'daemon-reload'])
-    run(['systemctl', 'enable', 'remna-auto-firewall'])
-    run(['systemctl', 'restart', 'remna-auto-firewall'])
+    # Older versions installed an allowlist. Remove only our own tracked files/table.
+    previous = tx.data.get('previous_state') or {}
+    if previous and SERVICE.exists():
+        tx.remember(SERVICE)
+        tx.remember(NFT)
+        run(['systemctl', 'disable', '--now', 'remna-auto-firewall'])
+        run(['nft', 'delete', 'table', 'inet', 'remna_auto'], check=False)
+        SERVICE.unlink(missing_ok=True)
+        NFT.unlink(missing_ok=True)
+        run(['systemctl', 'daemon-reload'])
     pinned = cfg.get('resolved_node_image', '')
     image_ref = (pinned if cfg.get('resolved_for_image') == cfg['node_image']
                  and re.fullmatch(r'(?:ghcr.io/)?remnawave/node@sha256:[a-f0-9]{64}', pinned)
@@ -632,7 +630,7 @@ def wait_connected(api, node_uuid):
         if node.get('isConnected') and not node.get('isDisabled'):
             return node
         time.sleep(2)
-    raise SetupError('Панель не подключилась к ноде. Проверьте её исходящий IP и доступ к node_port.')
+    raise SetupError('Панель не подключилась к ноде. Проверьте доступ панели к TCP 3001 и правила своего firewall.')
 
 
 def rollback(data, api):
@@ -671,6 +669,8 @@ def rollback(data, api):
         else:
             atomic(path, base64.b64decode(old['bytes']), old['mode'])
     run(['systemctl', 'daemon-reload'], check=False)
+    if data.get('firewall_was_enabled'):
+        run(['systemctl', 'enable', 'remna-auto-firewall'], check=False)
     if data['firewall_was_active']:
         run(['systemctl', 'restart', 'remna-auto-firewall'], check=False)
     if data['previous_state']:
@@ -695,11 +695,12 @@ def configure(args):
         log('\nRemna Auto · RemnaNode + Caddy Selfsteal\nCaddy: 443 · API ноды: 3001 · клиентский порт VPN: из профиля\n')
         cfg['panel_url'] = ask('HTTPS-адрес панели', cfg.get('panel_url', ''))
         cfg['domain'] = ask('Домен Caddy / SNI', cfg.get('domain', ''))
-        cfg['node_address'] = ask('IP/домен этой ноды для связи с панелью', cfg.get('node_address', cfg['domain']))
+        cfg['node_address'] = detect_ipv4(cfg['domain'])
+        log('IPv4 ноды определён автоматически: ' + cfg['node_address'])
         cfg['node_name'] = ask('Название ноды в панели', cfg.get('node_name', 'Node-01'))
-        cfg['node_port'] = ask('Порт управления RemnaNode', str(cfg.get('node_port', 3001)))
         cfg['country_code'] = ask('Код страны', cfg.get('country_code', 'XX'))
-        cfg['panel_ips'] = ask('Исходящие IP СЕРВЕРА панели через запятую (не IP CDN)', ','.join(cfg.get('panel_ips', [])))
+    if not cfg.get('node_address'):
+        cfg['node_address'] = detect_ipv4(cfg['domain'])
     cfg = validate_config(cfg)
     if args.refresh_image:
         cfg.pop('resolved_node_image', None)
