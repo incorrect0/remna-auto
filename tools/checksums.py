@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""Rebuild or verify the public release manifest; never include local config/secrets."""
+import hashlib
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+FILES = ['install.sh', 'run.sh', 'setup.py', 'config.example.json', 'README.md',
+         'CHANGELOG.md', 'DEVELOPMENT.md', 'site/index.html', 'tests/test_setup.py',
+         'tests/test_bootstrap.py', 'tools/checksums.py', '.github/workflows/check.yml', '.gitignore']
+text = ''.join(hashlib.sha256((ROOT / name).read_bytes()).hexdigest() + '  ' + name + '\n' for name in FILES)
+manifest = ROOT / 'SHA256SUMS'
+if '--check' in sys.argv:
+    if not manifest.exists() or manifest.read_text() != text:
+        raise SystemExit('SHA256SUMS устарел: выполните python tools/checksums.py')
+    print('SHA256SUMS OK')
+else:
+    manifest.write_text(text, encoding='utf-8', newline='\n')
+    print('SHA256SUMS updated')
