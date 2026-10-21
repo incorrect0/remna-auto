@@ -6,7 +6,7 @@ from pathlib import Path
 import socket
 import tempfile
 import unittest
-from unittest.mock import patch, Mock
+from unittest.mock import patch, Mock, PropertyMock
 import urllib.error
 import uuid
 
@@ -74,7 +74,7 @@ class ValidationTests(unittest.TestCase):
     def test_defaults_and_ipv6(self):
         c = s.validate_config(config())
         self.assertEqual(c['node_port'], 3001)
-        self.assertIn('2001:db8::1', c['panel_ips'])
+        self.assertNotIn('panel_ips', c)
 
     def test_domain_cannot_inject_caddy(self):
         for bad in ['https://x.test', 'x.test:443', '*.test.com', 'x.test\n{ abort }', 'x.test/path', 'x.test;id']:
@@ -91,17 +91,26 @@ class ValidationTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(s.SetupError):
                 s.validate_port(value)
 
-    def test_no_cidr_or_empty_panel_ips(self):
-        for ips in [[], ['0.0.0.0/0'], ['panel.example.com'], ['fe80::1%eth0'], ['fe80::1%x\nflush ruleset']]:
-            c = config();c['panel_ips'] = ips
-            with self.assertRaises(s.SetupError):
-                s.validate_config(c)
+    def test_management_port_fixed_and_no_allowlist(self):
+        c = config();c['node_port'] = 443;c['panel_ips'] = []
+        actual = s.validate_config(c)
+        self.assertEqual(actual['node_port'], 3001)
+        self.assertNotIn('panel_ips', actual)
 
-    def test_reserved_management_ports(self):
-        for port in [22, 80, 443]:
-            c = config();c['node_port'] = port
-            with self.assertRaises(s.SetupError):
-                s.validate_config(c)
+    @patch.object(s.ipaddress.IPv4Address, 'is_global', new_callable=PropertyMock, return_value=True)
+    def test_ipv4_detection_prefers_local_dns_match(self, _global):
+        with patch.object(s, 'local_ips', return_value={'203.0.113.12', '2001:db8::1'}), \
+             patch.object(s, 'resolve', return_value={'203.0.113.12'}):
+            self.assertEqual(s.detect_ipv4('node.example.com'), '203.0.113.12')
+
+    @patch.object(s.ipaddress.IPv4Address, 'is_global', new_callable=PropertyMock, return_value=True)
+    def test_ipv4_detection_dns_fallback_and_ambiguity(self, _global):
+        with patch.object(s, 'local_ips', return_value=set()), \
+             patch.object(s, 'resolve', return_value={'203.0.113.12'}):
+            self.assertEqual(s.detect_ipv4('node.example.com'), '203.0.113.12')
+        with patch.object(s, 'local_ips', return_value=set()), \
+             patch.object(s, 'resolve', return_value=set()), self.assertRaises(s.SetupError):
+            s.detect_ipv4('node.example.com')
 
     def test_only_official_images(self):
         c = config();c['node_image'] = 'unknown/evil:latest'
@@ -131,21 +140,20 @@ class ValidationTests(unittest.TestCase):
                 s.validate_inbound(raw, config())
 
     def test_selfsteal_target_sni_and_proxy_protocol(self):
-        for key, value in [('target', 'other.test:443'), ('serverNames', ['other.test']), ('xver', 1)]:
+        for key, value in [('target', ''), ('serverNames', ['other.test']), ('xver', 1)]:
             raw = inbound();raw['streamSettings']['realitySettings'][key] = value
             with self.subTest(key=key), self.assertRaises(s.SetupError):
                 s.validate_inbound(raw, config())
 
+    def test_external_reality_target_preserved(self):
+        raw = inbound();raw['streamSettings']['realitySettings'] = {
+            'dest': 'other.test:443', 'serverNames': ['other.test'], 'xver': 1}
+        original = copy.deepcopy(raw)
+        self.assertEqual(s.validate_inbound(raw, config()), {8443})
+        self.assertEqual(raw, original)
+
     def test_nonreality_profile_allowed(self):
         self.assertEqual(s.validate_inbound({'tag': 'tls', 'port': 9443}, config()), {9443})
-
-    def test_nft_only_management_port(self):
-        text = s.nft_config(config())
-        self.assertIn('ip saddr 198.51.100.10 tcp dport 3001 accept', text)
-        self.assertIn('ip6 saddr 2001:db8::1 tcp dport 3001 accept', text)
-        self.assertIn('tcp dport 3001 drop', text)
-        self.assertNotIn('flush ruleset', text)
-        self.assertNotIn('dport 22', text)
 
     def test_secret_redaction(self):
         s.SECRETS.append('super-secret-token')
