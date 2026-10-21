@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = '1.0.2'
+VERSION = '1.0.3'
 HERE = Path(__file__).resolve().parent
 ROOT = Path('/opt/remna-auto')
 STACK = Path('/opt/remnanode')
@@ -48,8 +48,54 @@ def safe(value):
     return value
 
 
+def color(text, code):
+    enabled = sys.stdout.isatty() and os.environ.get('TERM') != 'dumb' and 'NO_COLOR' not in os.environ
+    return f'\033[{code}m{text}\033[0m' if enabled else str(text)
+
+
+def section(title, detail=''):
+    width = min(shutil.get_terminal_size((80, 24)).columns, 76)
+    log('\n' + color('─' * max(12, width - 2), '38;5;60'))
+    log(color('  ' + title, '1;38;5;87'))
+    if detail:
+        log('  ' + detail)
+
+
+def banner():
+    width = shutil.get_terminal_size((80, 24)).columns
+    if width >= 64:
+        art = [
+            '  █▀█ █▀▀ █▀▄▀█ █▄ █ ▄▀█     ▄██▄██▄',
+            '  █▀▄ ██▄ █ ▀ █ █ ▀█ █▀█     ▀█████▀',
+            '                               ▀█▀',
+        ]
+        log('')
+        for line in art:
+            log(color(line[:28], '1;38;5;87') + color(line[28:], '1;38;5;211'))
+    else:
+        log('\n' + color('  remna ', '1;38;5;87') + color('<3', '1;38;5;211'))
+    log(color(f'  REMNA AUTO  /  v{VERSION}', '1;37'))
+    log(color('  RemnaNode + Caddy · сделано с любовью', '38;5;245'))
+    log(color('  HTTPS :443   /   NODE API :3001', '38;5;245'))
+
+
+def completion(cfg, connected):
+    section('✓ Нода готова к работе', 'RemnaNode + Caddy установлены')
+    for label, value in [('Нода', cfg['node_name']), ('Сайт', 'https://' + cfg['domain']),
+                         ('Профиль', cfg['profile_name']),
+                         ('VPN-порты', ', '.join(map(str, cfg['vpn_ports']))),
+                         ('Панель подключена', 'да' if connected else 'нет')]:
+        log('  ' + color(label + ': ', '38;5;245') + str(value))
+    log('\n  ' + color('Спасибо, что используете remna <3', '1;38;5;211'))
+
+
 def log(message):
-    print(safe(message), flush=True)
+    message = safe(message)
+    if message.startswith('ОШИБКА:'):
+        message = color(message, '1;31')
+    elif message.startswith('Внимание:'):
+        message = color(message, '33')
+    print(message, flush=True)
 
 
 def run(args, *, check=True, timeout=600, input=None):
@@ -185,7 +231,7 @@ def validate_config(cfg):
 
 def ask(label, default='', secret=False):
     suffix = f' [{default}]' if default and not secret else ''
-    value = (getpass.getpass if secret else input)(label + suffix + ': ').strip()
+    value = (getpass.getpass if secret else input)(color('  › ', '38;5;87') + label + color(suffix, '38;5;245') + ': ').strip()
     return value or default
 
 
@@ -692,7 +738,8 @@ def configure(args):
         cfg.update(read_json(Path(args.config), {}))
     interactive = not args.non_interactive
     if interactive:
-        log('\nRemna Auto · RemnaNode + Caddy Selfsteal\nCaddy: 443 · API ноды: 3001 · клиентский порт VPN: из профиля\n')
+        banner()
+        section('01 / Настройка подключения', 'Enter — оставить значение в скобках')
         cfg['panel_url'] = ask('HTTPS-адрес панели', cfg.get('panel_url', ''))
         cfg['domain'] = ask('Домен Caddy / SNI', cfg.get('domain', ''))
         cfg['node_address'] = detect_ipv4(cfg['domain'])
@@ -705,11 +752,15 @@ def configure(args):
     if args.refresh_image:
         cfg.pop('resolved_node_image', None)
         cfg.pop('resolved_for_image', None)
+    if interactive:
+        section('02 / Доступ к панели', 'API-ключ вводится скрыто и не сохраняется')
     token = load_token(args, interactive)
     proxy_key = os.environ.get('REMNA_PROXY_KEY', '')
     if interactive and ask('Панель требует отдельный X-Api-Key для reverse proxy? y/n', 'n').lower() == 'y':
         proxy_key = ask('Ключ reverse proxy (скрытый ввод)', secret=True)
     api = API(cfg['panel_url'], token, proxy_key)
+    if interactive:
+        section('03 / Профиль и inbound’ы', 'Выберите конфигурацию из вашей панели')
     choose_profile(api, cfg, interactive)
     return cfg, api, state
 
@@ -729,6 +780,7 @@ def load_token(args, interactive):
 
 
 def install(cfg, api, state):
+    section('04 / Проверка сервера', 'Порты, DNS и существующие службы')
     preflight(cfg, state)
     install_id = state.get('install_id') or str(uuid.uuid4())
     nodes = list_nodes(api)
@@ -748,9 +800,10 @@ def install(cfg, api, state):
     try:
         # Remember package-created defaults as absent on a fresh machine.
         tx.remember(CADDY)
+        section('05 / Установка', 'Docker · RemnaNode · Caddy · сайт')
         install_dependencies()
         prepare_local(cfg, secret, tx)
-        log('Проверка доверенного TLS-сертификата и сайта с правильным SNI…')
+        section('06 / Проверка соединения', 'HTTPS-сертификат, сайт и связь с панелью')
         verify_tls(cfg['domain'])
         node_uuid = register_node(api, cfg, state, tx)
         log('Запись ноды создана/обновлена. Проверка соединения с панелью…')
@@ -760,8 +813,7 @@ def install(cfg, api, state):
         tx.write(ROOT / 'state.json', json.dumps(new_state, ensure_ascii=False, indent=2))
         tx.data['completed'] = True
         tx.save()
-        log(f"\nГотово. Сайт: https://{cfg['domain']} · Нода: {cfg['node_name']} · Connected: {node['isConnected']}")
-        log('Профиль: ' + cfg['profile_name'] + ' · VPN-порты: ' + ', '.join(map(str, cfg['vpn_ports'])))
+        completion(cfg, node['isConnected'])
         log('API-ключ панели не сохранён. SECRET_KEY находится в /opt/remnanode/.env с правами 600.')
     except BaseException:
         log('Установка не завершена. Восстанавливаю предыдущие настройки…')
@@ -779,7 +831,7 @@ def status():
         return
     cfg = state['config']
     log(f"Нода: {cfg['node_name']} · {state['node_uuid']}\nСайт: https://{cfg['domain']}\nПрофиль: {cfg['profile_name']}")
-    for service in ('caddy', 'remna-auto-firewall'):
+    for service in ('caddy',):
         log(service + ': ' + run(['systemctl', 'is-active', service], check=False).stdout.strip())
     log(compose('ps').stdout)
     token = os.environ.get('REMNA_API_KEY')
@@ -797,7 +849,16 @@ def main():
     parser.add_argument('--non-interactive', action='store_true')
     parser.add_argument('--backup', help='Каталог резервной копии для rollback')
     parser.add_argument('--refresh-image', action='store_true', help='Явно обновить образ вместо сохранённого digest')
+    parser.add_argument('--preview', action='store_true', help='Показать оформление без подключения и установки')
     args = parser.parse_args()
+    if args.preview:
+        banner()
+        section('01 / Настройка подключения', 'Enter — оставить значение в скобках')
+        log('  › HTTPS-адрес панели: https://panel.example.com')
+        log('  › Домен Caddy / SNI: node.example.com')
+        completion(dict(node_name='Node-01', domain='node.example.com',
+                        profile_name='Selfsteal', vpn_ports=[444]), True)
+        return
     if args.command == 'status':
         status()
         return
