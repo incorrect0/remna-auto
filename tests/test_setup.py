@@ -76,6 +76,72 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(c['node_port'], 3001)
         self.assertNotIn('panel_ips', c)
 
+    def test_auto_name_collision_and_fallback(self):
+        nodes = [{'uuid': NODE, 'name': 'Germany'}, {'name': 'Germany 1'}]
+        self.assertEqual(s.automatic_name('Germany', nodes), 'Germany 2')
+        self.assertEqual(s.automatic_name('Germany', nodes, NODE), 'Germany')
+        self.assertEqual(s.automatic_name('auto-install', []), 'auto-install 1')
+
+    def test_country_lookup_and_fallback(self):
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = json.dumps({'ip': '203.0.113.12', 'country_code': 'DE',
+                                                'country_name': 'Germany'}).encode()
+        opener = Mock();opener.open.return_value = response
+        with patch.object(s.urllib.request, 'build_opener', return_value=opener):
+            self.assertEqual(s.country_for_ipv4('203.0.113.12'), ('DE', 'Germany'))
+        opener.open.side_effect = OSError('offline')
+        with patch.object(s.urllib.request, 'build_opener', return_value=opener):
+            self.assertEqual(s.country_for_ipv4('203.0.113.12'), ('XX', 'auto-install'))
+
+    def test_auto_inbounds_skip_reserved_and_duplicate_ports(self):
+        api = FakeAPI();c = config();c['inbound_uuids'] = []
+        for port in [443, 3001, 8443]:
+            raw = inbound();raw['port'] = port;raw['tag'] = 'port-' + str(port)
+            api.profile['config']['inbounds'].append(raw)
+            api.profile['inbounds'].append({'uuid': str(uuid.uuid4()), 'tag': raw['tag'], 'port': port})
+        with patch.object(s, 'occupied', return_value=''), patch.object(s, 'owned_node_pids', return_value=set()):
+            s.choose_profile(api, c, False)
+        self.assertEqual(c['inbound_uuids'], [INBOUND])
+        self.assertEqual(c['vpn_ports'], [8443])
+
+    def test_auto_inbounds_none_remaining(self):
+        api = FakeAPI();c = config();c['inbound_uuids'] = []
+        api.profile['config']['inbounds'][0]['port'] = 443
+        with patch.object(s, 'owned_node_pids', return_value=set()), self.assertRaises(s.SetupError):
+            s.choose_profile(api, c, False)
+
+    def test_bbr_supported_persists_and_unsupported_skips(self):
+        tx = Mock();tx.data = {}
+        def execute(args, **kwargs):
+            result = Mock(returncode=0)
+            result.stdout = ('cubic bbr' if args[-1] == 'net.ipv4.tcp_available_congestion_control'
+                             else 'bbr' if args == ['sysctl', '-n', 'net.ipv4.tcp_congestion_control'] else 'fq_codel')
+            return result
+        with patch.object(s, 'run', side_effect=execute):
+            s.enable_bbr(tx)
+        tx.write.assert_called_once()
+        self.assertIn('bbr_previous', tx.data)
+        tx = Mock();tx.data = {}
+        with patch.object(s, 'run', return_value=Mock(stdout='cubic', returncode=0)):
+            s.enable_bbr(tx)
+        tx.write.assert_not_called()
+
+    def test_bbr_failure_restores_previous_runtime(self):
+        tx = Mock();tx.data = {}
+        def execute(args, **kwargs):
+            if args == ['sysctl', '-w', 'net.ipv4.tcp_congestion_control=bbr']:
+                raise s.SetupError('denied')
+            value = ('cubic bbr' if args[-1] == 'net.ipv4.tcp_available_congestion_control'
+                     else 'cubic' if args[-1] == 'net.ipv4.tcp_congestion_control' else 'fq_codel')
+            return Mock(stdout=value, returncode=0)
+        with patch.object(s, 'run', side_effect=execute) as commands:
+            s.enable_bbr(tx)
+        commands.assert_any_call(['sysctl', '-w', 'net.core.default_qdisc=fq_codel'], check=False)
+        commands.assert_any_call(['sysctl', '-w', 'net.ipv4.tcp_congestion_control=cubic'], check=False)
+        tx.write.assert_not_called()
+
     def test_domain_cannot_inject_caddy(self):
         for bad in ['https://x.test', 'x.test:443', '*.test.com', 'x.test\n{ abort }', 'x.test/path', 'x.test;id']:
             with self.subTest(bad=bad), self.assertRaises(s.SetupError):
