@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = '1.0.3'
+VERSION = '1.0.4'
 HERE = Path(__file__).resolve().parent
 ROOT = Path('/opt/remna-auto')
 STACK = Path('/opt/remnanode')
@@ -64,14 +64,17 @@ def section(title, detail=''):
 def banner():
     width = shutil.get_terminal_size((80, 24)).columns
     if width >= 64:
-        art = [
-            '  █▀█ █▀▀ █▀▄▀█ █▄ █ ▄▀█     ▄██▄██▄',
-            '  █▀▄ ██▄ █ ▀ █ █ ▀█ █▀█     ▀█████▀',
-            '                               ▀█▀',
+        # Separate word/heart columns: no slicing through glyphs or half-block fonts.
+        word = [
+            r"   _ __ ___ _ __ ___  _ __   __ _ ",
+            r"  | '__/ _ \ '_ ` _ \| '_ \ / _` |",
+            r"  | | |  __/ | | | | | | | | (_| |",
+            r"  |_|  \___|_| |_| |_|_| |_|\__,_|",
         ]
+        heart = [' ▄██▄██▄ ', ' ███████ ', '  ▀███▀  ', '    ▀    ']
         log('')
-        for line in art:
-            log(color(line[:28], '1;38;5;87') + color(line[28:], '1;38;5;211'))
+        for text, icon in zip(word, heart):
+            log(color(text.ljust(36), '1;38;5;87') + color(icon, '1;38;5;211'))
     else:
         log('\n' + color('  remna ', '1;38;5;87') + color('<3', '1;38;5;211'))
     log(color(f'  REMNA AUTO  /  v{VERSION}', '1;37'))

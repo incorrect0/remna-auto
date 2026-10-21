@@ -1,4 +1,4 @@
-# Remna Auto 1.0.3
+# Remna Auto 1.0.4
 
 Собственный установщик RemnaNode + Caddy Selfsteal для Debian/Ubuntu с systemd.
 Написан с нуля; исходный код RemnaSetup не включён. Python 3.10+, стандартная библиотека.
