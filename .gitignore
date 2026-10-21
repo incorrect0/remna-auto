@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.env
+.env.*
+*.key
+*.pem
+*.dump
+config.json
+state.json
+rollback.json
+*.log
+backups/
+private/
+dist/
+.DS_Store

@@ -1,0 +1,12 @@
+{
+  "panel_url": "https://panel.example.com",
+  "domain": "node.example.com",
+  "node_address": "203.0.113.10",
+  "node_name": "Node-01",
+  "node_port": 3001,
+  "country_code": "DE",
+  "panel_ips": ["198.51.100.20"],
+  "profile_uuid": "",
+  "inbound_uuids": [],
+  "node_image": "remnawave/node:latest"
+}
