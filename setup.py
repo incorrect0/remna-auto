@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = '1.0.4'
+VERSION = '1.1.0'
 HERE = Path(__file__).resolve().parent
 ROOT = Path('/opt/remna-auto')
 STACK = Path('/opt/remnanode')
@@ -37,6 +37,10 @@ APT_SOURCE_FILE: Path | None = None
 
 
 class SetupError(Exception):
+    pass
+
+
+class PortConflictError(SetupError):
     pass
 
 
@@ -273,20 +277,8 @@ def choose_profile(api, cfg, interactive):
     inbounds = profile.get('inbounds', [])
     if not inbounds:
         raise SetupError('У профиля нет inbound’ов.')
-    if interactive and not cfg.get('inbound_uuids'):
-        log('\nInbound’ы выбранного профиля:')
-        for i, inbound in enumerate(inbounds, 1):
-            log(f"  {i}. {inbound['tag']} · {inbound.get('type')} · порт {inbound.get('port')}")
-        value = ask('Номера через запятую или all', 'all')
-        if value != 'all':
-            try:
-                numbers = {int(x.strip()) for x in value.split(',')}
-                if not numbers or min(numbers) < 1 or max(numbers) > len(inbounds):
-                    raise ValueError()
-                cfg['inbound_uuids'] = [p['uuid'] for i, p in enumerate(inbounds, 1) if i in numbers]
-            except ValueError:
-                raise SetupError('Некорректный список inbound’ов.') from None
-    selected = cfg.get('inbound_uuids') or [p['uuid'] for p in inbounds]
+    automatic = interactive or not cfg.get('inbound_uuids')
+    selected = [p['uuid'] for p in inbounds] if automatic else cfg['inbound_uuids']
     if not isinstance(selected, list) or not selected or not set(selected).issubset({p['uuid'] for p in inbounds}):
         raise SetupError('Inbound’ы не принадлежат выбранному профилю.')
     cfg['inbound_uuids'] = selected
@@ -297,13 +289,37 @@ def choose_profile(api, cfg, interactive):
         raise SetupError('Панель не вернула вычисленную конфигурацию с inbound’ами.')
     raw_by_tag = {b.get('tag'): b for b in config['inbounds'] if isinstance(b, dict)}
     ports = set()
+    accepted = []
+    own_pids = owned_node_pids() if automatic else set()
     for inbound in inbounds:
         if inbound['uuid'] not in selected:
             continue
         raw = raw_by_tag.get(inbound['tag'])
         if raw is None:
             raise SetupError(f"Не найден inbound {inbound['tag']} в вычисленной конфигурации.")
-        ports.update(validate_inbound(raw, cfg))
+        try:
+            candidate = validate_inbound(raw, cfg)
+            if candidate & ports:
+                raise PortConflictError('порт пересекается с ранее выбранным inbound')
+            if automatic and os.name == 'posix' and shutil.which('ss'):
+                for port in candidate:
+                    for proto in ('tcp', 'udp'):
+                        found = occupied(port, proto)
+                        pids = set(re.findall(r'pid=(\d+)', found))
+                        if found and not (pids and pids.issubset(own_pids)):
+                            raise PortConflictError(f'порт {port}/{proto} занят другой службой')
+        except PortConflictError as exc:
+            if not automatic:
+                raise
+            log(f"Пропущен {inbound['tag']}: {exc}")
+            continue
+        accepted.append(inbound['uuid'])
+        ports.update(candidate)
+    if not accepted:
+        raise SetupError('Не осталось inbound’ов без конфликтов портов. Выберите другой профиль.')
+    cfg['inbound_uuids'] = accepted
+    cfg['inbound_tags'] = [p['tag'] for p in inbounds if p['uuid'] in accepted]
+    log('Выбраны inbound’ы: ' + ', '.join(cfg['inbound_tags']))
     cfg['vpn_ports'] = sorted(ports)
     return profile
 
@@ -322,7 +338,7 @@ def validate_inbound(raw, cfg):
         ports = {validate_port(port)}
     reserved = {22, 80, 443, cfg['node_port']}
     if ports & reserved:
-        raise SetupError(f"Inbound {raw.get('tag')} занимает {sorted(ports & reserved)}. "
+        raise PortConflictError(f"Inbound {raw.get('tag')} занимает {sorted(ports & reserved)}. "
                          '443 занят Caddy, 3001 — API ноды; выберите другой inbound/профиль.')
     stream = raw.get('streamSettings', {})
     if stream.get('security') == 'reality':
@@ -356,6 +372,48 @@ def resolve(host):
 def local_ips():
     raw = json.loads(run(['ip', '-j', 'addr']).stdout)
     return {a['local'] for nic in raw for a in nic.get('addr_info', [])}
+
+
+def owned_node_pids():
+    if not read_json(ROOT / 'state.json', {}) or not shutil.which('docker'):
+        return set()
+    result = run(['docker', 'inspect', 'remnanode'], check=False)
+    if result.returncode:
+        return set()
+    container = json.loads(result.stdout)[0]
+    labels = container.get('Config', {}).get('Labels') or {}
+    if labels.get('com.docker.compose.project') != 'remna-auto':
+        return set()
+    top = run(['docker', 'top', 'remnanode', '-eo', 'pid'], check=False)
+    return set(re.findall(r'^\s*(\d+)\s*$', top.stdout, re.M))
+
+
+def country_for_ipv4(address):
+    try:
+        ip = ipaddress.IPv4Address(address)
+        opener = urllib.request.build_opener(NoRedirect(), urllib.request.ProxyHandler({}))
+        with opener.open(f'https://ipapi.co/{ip}/json/', timeout=8) as response:
+            data = json.loads(response.read(32769))
+        code, name = data.get('country_code', ''), data.get('country_name', '')
+        if data.get('error') or data.get('ip') != str(ip):
+            raise ValueError()
+        if not re.fullmatch('[A-Z]{2}', code) or not re.fullmatch(r"[A-Za-z][A-Za-z ()'.,-]{1,60}", name):
+            raise ValueError()
+        return code, name
+    except (SetupError, OSError, ValueError, TypeError, AttributeError):
+        log('Внимание: страна по IPv4 не определена; используется XX / auto-install.')
+        return 'XX', 'auto-install'
+
+
+def automatic_name(base, nodes, own_uuid=None):
+    base = base[:26].strip()
+    used = {node.get('name', '').casefold() for node in nodes if own_uuid is None or node.get('uuid') != own_uuid}
+    if base != 'auto-install' and base.casefold() not in used:
+        return base
+    number = 1
+    while f'{base} {number}'.casefold() in used:
+        number += 1
+    return f'{base} {number}'[:30]
 
 
 def detect_ipv4(domain):
@@ -487,7 +545,7 @@ def install_dependencies():
     refresh_sources()
     log('Для установки используются отдельные официальные HTTPS-источники APT; репозитории провайдера не изменяются.')
     run(['apt-get', 'update'])
-    run(['apt-get', 'install', '-y', 'ca-certificates', 'curl', 'gnupg', 'iproute2', 'logrotate'])
+    run(['apt-get', 'install', '-y', 'ca-certificates', 'curl', 'gnupg', 'iproute2', 'logrotate', 'procps', 'kmod'])
     if not shutil.which('docker'):
         key = run(['curl', '-fsSL', '--retry', '3', f'https://download.docker.com/linux/{distro}/gpg']).stdout
         Path('/etc/apt/keyrings').mkdir(parents=True, exist_ok=True)
@@ -718,6 +776,8 @@ def rollback(data, api):
         else:
             atomic(path, base64.b64decode(old['bytes']), old['mode'])
     run(['systemctl', 'daemon-reload'], check=False)
+    for key, value in data.get('bbr_previous', {}).items():
+        run(['sysctl', '-w', key + '=' + value], check=False)
     if data.get('firewall_was_enabled'):
         run(['systemctl', 'enable', 'remna-auto-firewall'], check=False)
     if data['firewall_was_active']:
@@ -747,10 +807,12 @@ def configure(args):
         cfg['domain'] = ask('Домен Caddy / SNI', cfg.get('domain', ''))
         cfg['node_address'] = detect_ipv4(cfg['domain'])
         log('IPv4 ноды определён автоматически: ' + cfg['node_address'])
-        cfg['node_name'] = ask('Название ноды в панели', cfg.get('node_name', 'Node-01'))
-        cfg['country_code'] = ask('Код страны', cfg.get('country_code', 'XX'))
     if not cfg.get('node_address'):
         cfg['node_address'] = detect_ipv4(cfg['domain'])
+    country, base_name = country_for_ipv4(cfg['node_address'])
+    cfg['country_code'] = country
+    cfg['node_name'] = base_name[:26]
+    cfg['auto_name_base'] = base_name
     cfg = validate_config(cfg)
     if args.refresh_image:
         cfg.pop('resolved_node_image', None)
@@ -759,9 +821,9 @@ def configure(args):
         section('02 / Доступ к панели', 'API-ключ вводится скрыто и не сохраняется')
     token = load_token(args, interactive)
     proxy_key = os.environ.get('REMNA_PROXY_KEY', '')
-    if interactive and ask('Панель требует отдельный X-Api-Key для reverse proxy? y/n', 'n').lower() == 'y':
-        proxy_key = ask('Ключ reverse proxy (скрытый ввод)', secret=True)
     api = API(cfg['panel_url'], token, proxy_key)
+    cfg['node_name'] = automatic_name(base_name, list_nodes(api), state.get('node_uuid'))
+    log('Нода: ' + cfg['node_name'] + ' · страна: ' + cfg['country_code'])
     if interactive:
         section('03 / Профиль и inbound’ы', 'Выберите конфигурацию из вашей панели')
     choose_profile(api, cfg, interactive)
@@ -782,11 +844,40 @@ def load_token(args, interactive):
     return token
 
 
+def enable_bbr(tx):
+    keys = ('net.core.default_qdisc', 'net.ipv4.tcp_congestion_control')
+    old = {}
+    try:
+        for key in keys:
+            old[key] = run(['sysctl', '-n', key]).stdout.strip()
+        run(['modprobe', 'tcp_bbr'], check=False)
+        run(['modprobe', 'sch_fq'], check=False)
+        available = run(['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control']).stdout.split()
+        if 'bbr' not in available:
+            log('Внимание: ядро не поддерживает BBR; установка продолжится без него.')
+            return
+        tx.data['bbr_previous'] = old
+        tx.save()
+        run(['sysctl', '-w', 'net.core.default_qdisc=fq'])
+        run(['sysctl', '-w', 'net.ipv4.tcp_congestion_control=bbr'])
+        if run(['sysctl', '-n', keys[1]]).stdout.strip() != 'bbr':
+            raise SetupError('Проверка BBR не прошла')
+        tx.write(Path('/etc/sysctl.d/99-remna-auto-bbr.conf'),
+                 '# Managed by remna-auto\nnet.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n', 0o644)
+        log('BBR включён автоматически · default_qdisc=fq')
+    except (SetupError, OSError, subprocess.TimeoutExpired) as exc:
+        for key, value in old.items():
+            run(['sysctl', '-w', key + '=' + value], check=False)
+        log('Внимание: BBR не включён; прежние параметры восстановлены. ' + safe(exc))
+
+
 def install(cfg, api, state):
     section('04 / Проверка сервера', 'Порты, DNS и существующие службы')
     preflight(cfg, state)
     install_id = state.get('install_id') or str(uuid.uuid4())
     nodes = list_nodes(api)
+    if cfg.get('auto_name_base'):
+        cfg['node_name'] = automatic_name(cfg['auto_name_base'], nodes, state.get('node_uuid'))
     for node in nodes:
         if node['uuid'] == state.get('node_uuid'):
             continue
@@ -805,6 +896,7 @@ def install(cfg, api, state):
         tx.remember(CADDY)
         section('05 / Установка', 'Docker · RemnaNode · Caddy · сайт')
         install_dependencies()
+        enable_bbr(tx)
         prepare_local(cfg, secret, tx)
         section('06 / Проверка соединения', 'HTTPS-сертификат, сайт и связь с панелью')
         verify_tls(cfg['domain'])

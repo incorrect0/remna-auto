@@ -2,8 +2,6 @@
   "panel_url": "https://panel.example.com",
   "domain": "node.example.com",
   "node_address": "",
-  "node_name": "Node-01",
-  "country_code": "DE",
   "profile_uuid": "",
   "inbound_uuids": [],
   "node_image": "remnawave/node:latest"
