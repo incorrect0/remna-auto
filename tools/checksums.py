@@ -7,7 +7,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 FILES = ['install.sh', 'run.sh', 'setup.py', 'config.example.json', 'README.md',
          'CHANGELOG.md', 'DEVELOPMENT.md', 'site/index.html', 'tests/test_setup.py',
-         'tests/test_bootstrap.py', 'tools/checksums.py', '.github/workflows/check.yml', '.gitignore']
+         'tests/test_bootstrap.py', 'tools/checksums.py', 'tools/check_public_files.py',
+         '.github/workflows/check.yml', '.gitignore', '.gitattributes']
 text = ''.join(hashlib.sha256((ROOT / name).read_bytes()).hexdigest() + '  ' + name + '\n' for name in FILES)
 manifest = ROOT / 'SHA256SUMS'
 if '--check' in sys.argv:
