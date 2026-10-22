@@ -399,7 +399,7 @@ class LifecycleTests(unittest.TestCase):
         api=s.API('https://panel.example.com','super-secret-token')
         api.opener=Mock()
         api.opener.open.side_effect=urllib.error.HTTPError('https://panel.example.com/api/nodes',401,'Unauthorized',{},None)
-        with self.assertRaises(s.SetupError) as exc:api.request('POST','/api/nodes',{})
+        with self.assertRaises(s.SetupError) as exc:api._request_direct('POST','/api/nodes',{})
         self.assertNotIn('super-secret-token',str(exc.exception))
         self.assertEqual(api.opener.open.call_count,1)
 
