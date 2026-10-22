@@ -22,6 +22,20 @@ import controller as c
 
 
 class InterfaceTests(unittest.TestCase):
+    def test_plan_never_echoes_unknown_config_fields(self):
+        out = io.StringIO()
+        with patch.object(s.sys, 'argv', ['setup.py', 'plan']), \
+             patch.object(s, 'configure', return_value=({'domain': 'node.example.com', 'api_key': 'hidden-canary'}, Mock(), {})), \
+             contextlib.redirect_stdout(out):
+            s.main()
+        self.assertNotIn('hidden-canary', out.getvalue())
+        self.assertIn('node.example.com', out.getvalue())
+
+    def test_secret_fields_in_public_config_are_rejected(self):
+        with self.assertRaises(s.SetupError) as error:
+            s.validate_config({'api_key': 'hidden-canary'})
+        self.assertNotIn('hidden-canary', str(error.exception))
+
     def test_compact_ssh_input_defaults_and_custom_values(self):
         self.assertEqual(c.parse_ssh_target('203.0.113.12'), ('203.0.113.12', 'root', 22))
         self.assertEqual(c.parse_ssh_target('admin@203.0.113.12:2222'), ('203.0.113.12', 'admin', 2222))
