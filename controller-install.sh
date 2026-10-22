@@ -9,15 +9,13 @@ if [[ -d "$TARGET" && ! -f "$TARGET/.managed" ]]; then
     exit 1
 fi
 echo 'Не рекомендуется устанавливать контроллер на сервер с панелью. Используйте отдельный сервер.'
-APT=(apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
-if [[ -f /opt/remna-auto/install.sources.list ]]; then
-    APT+=(-o Dir::Etc::sourcelist=/opt/remna-auto/install.sources.list -o Dir::Etc::sourceparts=-)
-fi
-"${APT[@]}" update
-DEBIAN_FRONTEND=noninteractive "${APT[@]}" install -y python3 python3-paramiko ca-certificates
+bash "$BASE/bootstrap-deps.sh" python3 python3-paramiko ca-certificates
+python3 -c 'import sys; assert sys.version_info >= (3,10), "Нужен Python 3.10+"'
 install -d -m 700 "$TARGET" "$TARGET/site" /etc/remna-auto-controller
-for name in setup.py controller.py remote_worker.py; do
-    install -m 600 "$BASE/$name" "$TARGET/$name"
+touch "$TARGET/.managed"
+for name in setup.py controller.py remote_worker.py bootstrap-deps.sh; do
+    install -m 600 "$BASE/$name" "$TARGET/$name.new"
+    mv -f -- "$TARGET/$name.new" "$TARGET/$name"
 done
 install -m 600 "$BASE/site/index.html" "$TARGET/site/index.html"
 touch "$TARGET/.managed"

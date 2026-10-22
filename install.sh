@@ -5,7 +5,7 @@ umask 077
 REPOSITORY='incorrect0/remna-auto'
 REF="${REMNA_AUTO_REF:-main}"
 COMMAND="${1:-install}"
-if [[ "$COMMAND" != plan && "$COMMAND" != status && ${EUID} -ne 0 ]]; then
+if [[ "$COMMAND" != plan && "$COMMAND" != status && "$COMMAND" != --help && "$COMMAND" != -h && "$COMMAND" != --version && "$COMMAND" != --preview && ${EUID} -ne 0 ]]; then
     echo 'Запустите команду от root.' >&2
     exit 1
 fi
@@ -24,8 +24,8 @@ if ! command -v python3 >/dev/null || ! command -v curl >/dev/null; then
         echo 'Для загрузчика нужны curl и Python 3.10+ (Debian/Ubuntu).' >&2
         exit 1
     fi
-    apt-get -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
-    apt-get -y install python3 curl ca-certificates
+    timeout 180 apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o DPkg::Lock::Timeout=60 update
+    timeout 300 apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o DPkg::Lock::Timeout=60 -y install python3 curl ca-certificates
 fi
 TEMP_DIR="$(mktemp -d /tmp/remna-auto.XXXXXXXX)"
 cleanup() {
