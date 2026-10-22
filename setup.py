@@ -21,8 +21,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import unicodedata
+import signal
 
-VERSION = '1.2.2'
+VERSION = '1.3.0'
 HERE = Path(__file__).resolve().parent
 ROOT = Path('/opt/remna-auto')
 STACK = Path('/opt/remnanode')
@@ -46,10 +48,43 @@ class PortConflictError(SetupError):
 
 def safe(value):
     value = str(value)
-    for secret in SECRETS:
+    for secret in sorted(set(SECRETS), key=len, reverse=True):
         if secret:
             value = value.replace(secret, '[REDACTED]')
-    return value
+    # Remove terminal-control payloads from profile names, command output and errors.
+    value = re.sub(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)', '', value)
+    value = re.sub(r'\x1b\[(?![0-9;]*m)[0-?]*[ -/]*[@-~]', '', value)
+    value = re.sub(r'\x1b(?!\[[0-9;]*m)', '', value)
+    return ''.join(c for c in value if c in '\n\t\x1b' or unicodedata.category(c)[0] != 'C')
+
+
+def terminal_width():
+    return max(4, min(shutil.get_terminal_size((80, 24)).columns, 100))
+
+
+def visible_width(text):
+    text = re.sub(r'\x1b\[[0-9;]*m', '', text)
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1 for c in text)
+
+
+def wrapped(text, width):
+    lines = []
+    for line in str(text).expandtabs(4).split('\n'):
+        current = ''; size = 0
+        for token in re.findall(r'\x1b\[[0-9;]*m|[^\x1b]', line):
+            amount = 0 if token.startswith('\x1b') else visible_width(token)
+            if size + amount > width:
+                split = current.rfind(' ')
+                if split > 2:
+                    lines.append(current[:split])
+                    current = '  ' + current[split + 1:]
+                else:
+                    lines.append(current)
+                    current = '  '
+                size = visible_width(current)
+            current += token; size += amount
+        lines.append(current)
+    return '\n'.join(lines)
 
 
 def color(text, code):
@@ -58,8 +93,8 @@ def color(text, code):
 
 
 def section(title, detail=''):
-    width = min(shutil.get_terminal_size((80, 24)).columns, 76)
-    log('\n' + color('─' * max(12, width - 2), '38;5;60'))
+    width = min(terminal_width(), 76)
+    log('\n' + color('─' * max(1, width - 2), '38;5;60'))
     log(color('  ' + title, '1;38;5;87'))
     if detail:
         log('  ' + detail)
@@ -67,7 +102,7 @@ def section(title, detail=''):
 
 def banner():
     width = shutil.get_terminal_size((80, 24)).columns
-    if width >= 64:
+    if width >= 64 and sys.stdout.isatty() and os.environ.get('TERM') != 'dumb':
         # Separate word/heart columns: no slicing through glyphs or half-block fonts.
         word = [
             r"   _ __ ___ _ __ ___  _ __   __ _ ",
@@ -82,12 +117,12 @@ def banner():
     else:
         log('\n' + color('  remna ', '1;38;5;87') + color('<3', '1;38;5;211'))
     log(color(f'  REMNA AUTO  /  v{VERSION}', '1;37'))
-    log(color('  RemnaNode + Caddy · сделано с любовью', '38;5;245'))
-    log(color('  HTTPS :443   /   NODE API :3001', '38;5;245'))
+    log(color('  RemnaNode + Caddy', '38;5;245'))
+    log(color('  HTTPS:443 | API:3001', '38;5;245'))
 
 
 def completion(cfg, connected):
-    section('✓ Нода установлена', 'RemnaNode + Caddy установлены')
+    section('[OK] Нода установлена', 'RemnaNode + Caddy установлены')
     if cfg.get('tls_ready') is False:
         log('  HTTPS: ожидает сертификата. Selfsteal через этот Caddy заработает после выпуска.')
     for label, value in [('Нода', cfg['node_name']), ('Сайт', 'https://' + cfg['domain']),
@@ -100,11 +135,14 @@ def completion(cfg, connected):
 
 def log(message):
     message = safe(message)
+    if not (sys.stdout.isatty() and os.environ.get('TERM') != 'dumb' and 'NO_COLOR' not in os.environ):
+        message = re.sub(r'\x1b\[[0-9;]*m', '', message)
     if message.startswith('ОШИБКА:'):
         message = color(message, '1;31')
     elif message.startswith('Внимание:'):
         message = color(message, '33')
-    print(message, flush=True)
+    message = '\n'.join('  ' + line if line and not re.sub(r'\x1b\[[0-9;]*m', '', line).startswith('  ') else line for line in message.split('\n'))
+    print(wrapped(message, terminal_width()), flush=True)
 
 
 def run(args, *, check=True, timeout=600, input=None):
@@ -114,12 +152,42 @@ def run(args, *, check=True, timeout=600, input=None):
                 '-o', 'Acquire::https::Timeout=20', '-o', 'DPkg::Lock::Timeout=120', *args[1:]]
         if APT_SOURCE_FILE:
             args[1:1] = ['-o', 'Dir::Etc::sourcelist=' + str(APT_SOURCE_FILE), '-o', 'Dir::Etc::sourceparts=-']
-    result = subprocess.run([str(x) for x in args], input=input, text=True,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
-                            env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive'})
+    command = [str(x) for x in args]
+    started = time.monotonic()
+    process = subprocess.Popen(command, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                               text=True, encoding='utf-8', errors='replace', stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               start_new_session=os.name == 'posix',
+                               env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive'})
+    first = True
+    try:
+        while True:
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command[0], timeout)
+            try:
+                output, _ = process.communicate(input=input if first else None, timeout=min(10, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                first = False
+                if time.monotonic() - started >= timeout:
+                    raise subprocess.TimeoutExpired(command[0], timeout) from None
+                log(f'  Выполняется {Path(command[0]).name}: {int(time.monotonic() - started)} с…')
+    except BaseException:
+        if os.name == 'posix':
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            process.kill()
+        process.communicate()
+        raise
+    result = subprocess.CompletedProcess(command, process.returncode, output)
+
     if check and result.returncode:
         # Never render argv: environment files and API headers must stay private.
-        raise SetupError(f'Ошибка команды {Path(str(args[0])).name}:\n{safe(result.stdout[-3000:])}')
+        raise SetupError(f'Не удалось выполнить {Path(str(args[0])).name} (код {result.returncode}).\n'
+                         f'{safe(result.stdout[-2000:])}\nПроверьте доступность сети, свободное место и состояние службы; повторный запуск не удаляет чужие файлы.')
     return result
 
 
@@ -140,7 +208,10 @@ def atomic(path: Path, content: bytes | str, mode=0o600):
 
 
 def read_json(path, default=None):
-    return json.loads(path.read_text()) if path.exists() else default
+    try:
+        return json.loads(path.read_text(encoding='utf-8')) if path.exists() else default
+    except (ValueError, OSError):
+        raise SetupError('Не удалось прочитать JSON: ' + str(path) + '. Проверьте формат и права; файл не изменён.') from None
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -154,10 +225,54 @@ class API:
         if not token or any(c in token + proxy_key for c in '\r\n'):
             raise SetupError('Пустой или некорректный API-ключ.')
         self.token, self.proxy_key = token, proxy_key or token
-        SECRETS.extend([token, proxy_key])
+        SECRETS.extend([token, proxy_key, self.url])
         self.opener = urllib.request.build_opener(NoRedirect(), urllib.request.ProxyHandler({}))
 
     def request(self, method, path, body=None):
+        # A socket timeout does not bound DNS or a slow streaming response. Isolate
+        # the request so a timed-out mutating request cannot continue in a thread.
+        code = ("import runpy,json,sys\n"
+                "m=runpy.run_path(sys.argv[1]); q=json.load(sys.stdin)\n"
+                "try:\n"
+                " a=m['API'](q['url'],q['token'],q['proxy']); "
+                "r=a._request_direct(q['method'],q['path'],q['body']); "
+                "print(json.dumps({'result':r}))\n"
+                "except Exception as e:\n print(json.dumps({'error':m['safe'](str(e))})); sys.exit(1)\n")
+        payload = json.dumps({'url': self.url, 'token': self.token, 'proxy': self.proxy_key,
+                              'method': method, 'path': path, 'body': body})
+        process = subprocess.Popen([sys.executable, '-c', code, str(HERE / 'setup.py')],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding='utf-8', errors='replace')
+        deadline = time.monotonic() + (90 if method == 'GET' else 30)
+        first = True
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SetupError('Тайм-аут API панели. Проверьте DNS/сеть панели и повторите запуск.')
+                try:
+                    output, _ = process.communicate(input=payload if first else None, timeout=min(10, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    first = False
+                    log('  Ожидание ответа панели…')
+        except BaseException:
+            process.kill()
+            process.communicate()
+            raise
+        try:
+            reply = json.loads(output)
+            if not isinstance(reply, dict):
+                raise ValueError()
+        except (ValueError, TypeError):
+            raise SetupError('API-процесс завершился без корректного ответа. Проверьте Python и доступность панели.') from None
+        if 'error' in reply:
+            raise SetupError(safe(reply['error']))
+        if process.returncode or 'result' not in reply:
+            raise SetupError('Ошибка процесса API панели; секреты не выводятся.')
+        return reply['result']
+
+    def _request_direct(self, method, path, body=None):
         if not path.startswith('/api/'):
             raise SetupError('Некорректный API endpoint.')
         headers = {'Authorization': 'Bearer ' + self.token, 'X-Api-Key': self.proxy_key,
@@ -213,7 +328,14 @@ def validate_port(value):
 
 
 def validate_config(cfg):
+    if not isinstance(cfg, dict):
+        raise SetupError('config.json должен содержать JSON-объект с параметрами.')
     cfg = dict(cfg)
+    for key in ('panel_url', 'domain', 'node_address', 'node_name', 'country_code', 'node_image'):
+        if key in cfg and not isinstance(cfg[key], str):
+            raise SetupError('Поле ' + key + ' должно быть строкой.')
+    if any(key in cfg for key in ('api_key', 'token', 'password', 'ssh_password', 'proxy_key')):
+        raise SetupError('Не храните секреты в config.json. Используйте скрытый ввод, REMNA_API_KEY или --api-key-file.')
     cfg['panel_url'] = validate_panel_url(cfg.get('panel_url', ''))
     cfg['domain'] = validate_domain(cfg.get('domain', ''))
     address = cfg.get('node_address', '').strip()
@@ -240,8 +362,42 @@ def validate_config(cfg):
 
 def ask(label, default='', secret=False):
     suffix = f' [{default}]' if default and not secret else ''
-    value = (getpass.getpass if secret else input)(color('  › ', '38;5;87') + label + color(suffix, '38;5;245') + ': ').strip()
+    question = color('  > ', '38;5;87') + safe(label) + color(safe(suffix), '38;5;245') + ': '
+    value = (getpass.getpass if secret else input)(wrapped(question, terminal_width())).strip()
     return value or default
+
+
+def ask_validated(label, validator, default='', secret=False):
+    while True:
+        value = ask(label, default, secret)
+        try:
+            return validator(value)
+        except (SetupError, ValueError) as exc:
+            log('Внимание: ' + safe(exc))
+
+
+def confirm(message):
+    return ask(message + ' Введите yes для подтверждения', 'no').lower() == 'yes'
+
+
+def select_profile(profiles, default=None):
+    if not profiles:
+        raise SetupError('В панели нет профилей. Создайте профиль в панели и повторите выбор.')
+    for i, item in enumerate(profiles, 1):
+        log(f"  {i}. {item['name']}")
+    def number(value):
+        try:
+            index = int(value) - 1
+        except ValueError:
+            raise SetupError('Введите номер профиля из списка.') from None
+        if not 0 <= index < len(profiles):
+            raise SetupError('Такого номера нет в списке.')
+        return profiles[index]['uuid']
+    suggested = next((str(i) for i, p in enumerate(profiles, 1) if p['uuid'] == default), '')
+    if len(profiles) == 1:
+        log('  Единственный профиль выбран автоматически.')
+        return profiles[0]['uuid']
+    return ask_validated('Номер профиля', number, suggested)
 
 
 def choose_profile(api, cfg, interactive):
@@ -256,16 +412,8 @@ def choose_profile(api, cfg, interactive):
     if not cfg.get('profile_uuid'):
         if not interactive:
             raise SetupError('В config.json нужен profile_uuid; запустите интерактивно для выбора.')
-        log('\nДоступные профили:')
-        for i, p in enumerate(profiles, 1):
-            log(f"  {i}. {p['name']}  ({p['uuid']})")
-        try:
-            number = int(ask('Номер профиля'))
-            if not 1 <= number <= len(profiles):
-                raise ValueError()
-            cfg['profile_uuid'] = profiles[number - 1]['uuid']
-        except ValueError:
-            raise SetupError('Нет профиля с таким номером.') from None
+        log('Доступные профили:')
+        cfg['profile_uuid'] = select_profile(profiles)
     if cfg['profile_uuid'] not in {p['uuid'] for p in profiles}:
         raise SetupError('Выбранный профиль больше не существует или недоступен API-ключу.')
     profile = api.request('GET', '/api/config-profiles/' + cfg['profile_uuid'])
@@ -726,7 +874,11 @@ def prepare_local(cfg, secret, tx):
     image_ref = (pinned if cfg.get('resolved_for_image') == cfg['node_image']
                  and re.fullmatch(r'(?:ghcr.io/)?remnawave/node@sha256:[a-f0-9]{64}', pinned)
                  else cfg['node_image'])
-    run(['docker', 'pull', image_ref], timeout=1200)
+    available = run(['docker', 'image', 'inspect', image_ref], check=False)
+    if '@sha256:' not in image_ref or available.returncode:
+        run(['docker', 'pull', image_ref], timeout=1200)
+    else:
+        log('  Сохранённый образ уже загружен; повторное скачивание не требуется.')
     image = json.loads(run(['docker', 'image', 'inspect', image_ref]).stdout)[0]
     digest = next((s for s in image.get('RepoDigests', []) if 'remnawave/node@sha256:' in s), None)
     if not digest:
@@ -753,15 +905,21 @@ def prepare_local(cfg, secret, tx):
         raise SetupError('Нода не открыла порт управления; проверьте docker logs remnanode.')
 
 
-def verify_tls(domain, attempts=60):
+def verify_tls(domain, attempts=60, timeout=45):
     context = ssl.create_default_context()
+    deadline = time.monotonic() + timeout
+    last_status = time.monotonic()
     for _ in range(attempts):
+        if time.monotonic() >= deadline:
+            break
         try:
             with socket.create_connection(('127.0.0.1', 443), timeout=5) as tcp:
                 with context.wrap_socket(tcp, server_hostname=domain) as tls:
                     tls.sendall(f'GET / HTTP/1.1\r\nHost: {domain}\r\nConnection: close\r\n\r\n'.encode())
                     body = b''
                     while len(body) < 512 * 1024:
+                        if time.monotonic() >= deadline:
+                            raise OSError("HTTPS verification deadline")
                         chunk = tls.recv(16384)
                         if not chunk:
                             break
@@ -770,7 +928,10 @@ def verify_tls(domain, attempts=60):
                         return
         except (OSError, ssl.SSLError):
             pass
-        time.sleep(2)
+        if time.monotonic() - last_status >= 10:
+            log('  Ожидание HTTPS-сертификата Caddy…')
+            last_status = time.monotonic()
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
     raise SetupError('Не получен валидный сертификат/ответ сайта. Проверьте DNS, входящие 80/443 и journalctl -u caddy.')
 
 
@@ -872,17 +1033,46 @@ def rollback(data, api):
         raise SetupError('Локальные файлы восстановлены, но откат API требует проверки: ' + '; '.join(errors))
 
 
+def pending_transaction():
+    pointer = read_json(ROOT / 'pending.json', {})
+    if not pointer:
+        return None
+    path = Path(pointer.get('backup', '')).resolve()
+    if BACKUPS.resolve() not in path.parents:
+        raise SetupError('Некорректный путь журнала восстановления. Проверьте pending.json вручную.')
+    data = read_json(path / 'rollback.json')
+    if not isinstance(data, dict):
+        raise SetupError('Журнал незавершённой установки не найден; файлы не изменены.')
+    if data.get('completed'):
+        return None
+    return data
+
+
+def recover_pending(api, interactive):
+    data = pending_transaction()
+    if data is None:
+        return
+    log('Внимание: предыдущая установка прервана. Есть сохранённый журнал отката.')
+    if not interactive or not confirm('Восстановить прежние файлы и собственную запись ноды перед новым запуском?'):
+        raise SetupError('Восстановление не подтверждено. Установка не продолжена; журнал сохранён в /var/backups/remna-auto.')
+    rollback(data, api)
+    (ROOT / 'pending.json').unlink(missing_ok=True)
+    log('Предыдущее состояние восстановлено. Можно повторить установку.')
+
+
 def configure(args):
     state = read_json(ROOT / 'state.json', {})
-    cfg = dict(state.get('config', {}))
+    pending = pending_transaction()
+    cfg = dict((pending or state).get('config', {}))
     if args.config:
         cfg.update(read_json(Path(args.config), {}))
     interactive = not args.non_interactive
     if interactive:
         banner()
-        section('01 / Настройка подключения', 'Enter — оставить значение в скобках')
-        cfg['panel_url'] = ask('HTTPS-адрес панели', cfg.get('panel_url', ''))
-        cfg['domain'] = ask('Домен Caddy / SNI', cfg.get('domain', ''))
+        section('01 / Настройка подключения', 'Домен можно добавить в DNS позже')
+        cfg['panel_url'] = ask_validated('HTTPS-адрес панели (скрыто)', validate_panel_url, cfg.get('panel_url', ''), True)
+        SECRETS.append(cfg['panel_url'])
+        cfg['domain'] = ask_validated('Домен Caddy / SNI', validate_domain, cfg.get('domain', ''))
         cfg['node_address'] = detect_ipv4(cfg['domain'])
         log('IPv4 ноды определён автоматически: ' + cfg['node_address'])
     if not cfg.get('node_address'):
@@ -904,6 +1094,9 @@ def configure(args):
     log('Нода: ' + cfg['node_name'] + ' · страна: ' + cfg['country_code'])
     if interactive:
         section('03 / Профиль и inbound’ы', 'Выберите конфигурацию из вашей панели')
+    if args.command != 'plan':
+        recover_pending(api, interactive)
+        state = read_json(ROOT / 'state.json', {})
     choose_profile(api, cfg, interactive)
     return cfg, api, state
 
@@ -968,6 +1161,7 @@ def install(cfg, api, state):
     SECRETS.append(secret)
     ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     tx = Transaction(state, cfg, install_id)
+    atomic(ROOT / 'pending.json', json.dumps({'backup': str(tx.path)}))
     log('Резервная копия и журнал отката: ' + str(tx.path))
     try:
         # Remember package-created defaults as absent on a fresh machine.
@@ -994,12 +1188,14 @@ def install(cfg, api, state):
         tx.write(ROOT / 'state.json', json.dumps(new_state, ensure_ascii=False, indent=2))
         tx.data['completed'] = True
         tx.save()
+        (ROOT / 'pending.json').unlink(missing_ok=True)
         completion(cfg, node['isConnected'])
         log('API-ключ панели не сохранён. SECRET_KEY находится в /opt/remnanode/.env с правами 600.')
     except BaseException:
         log('Установка не завершена. Восстанавливаю предыдущие настройки…')
         try:
             rollback(tx.data, api)
+            (ROOT / 'pending.json').unlink(missing_ok=True)
         except BaseException as exc:
             log('Требуется проверка отката: ' + safe(exc))
         raise
@@ -1008,10 +1204,13 @@ def install(cfg, api, state):
 def status():
     state = read_json(ROOT / 'state.json', {})
     if not state:
+        if (ROOT / 'pending.json').exists():
+            log('Внимание: установка прервана. Повторите install для восстановления с подтверждением.')
         log('Управляемая установка не найдена.')
         return
     cfg = state['config']
     log(f"Нода: {cfg['node_name']} · {state['node_uuid']}\nСайт: https://{cfg['domain']}\nПрофиль: {cfg['profile_name']}")
+    log('  HTTPS: ' + ('проверен при установке' if cfg.get('tls_ready') else 'ожидает DNS/сертификат; проверьте journalctl -u caddy'))
     for service in ('caddy',):
         log(service + ': ' + run(['systemctl', 'is-active', service], check=False).stdout.strip())
     log(compose('ps').stdout)
@@ -1024,17 +1223,20 @@ def status():
 
 def main():
     parser = argparse.ArgumentParser(description='Автоматическая установка RemnaNode и Caddy Selfsteal')
+    parser.add_argument('--version', action='version', version='remna-auto ' + VERSION)
     parser.add_argument('command', nargs='?', choices=['install', 'plan', 'status', 'rollback'], default='install')
     parser.add_argument('--config', help='JSON с несекретными параметрами')
     parser.add_argument('--api-key-file', help='Файл с API-ключом, права 600')
     parser.add_argument('--non-interactive', action='store_true')
     parser.add_argument('--backup', help='Каталог резервной копии для rollback')
     parser.add_argument('--refresh-image', action='store_true', help='Явно обновить образ вместо сохранённого digest')
+    parser.add_argument('--yes', action='store_true', help='Подтвердить явно запрошенный неинтерактивный откат')
     parser.add_argument('--preview', action='store_true', help='Показать оформление без подключения и установки')
     args = parser.parse_args()
     if args.preview:
         banner()
-        section('01 / Настройка подключения', 'Enter — оставить значение в скобках')
+        log('  Демонстрация оформления. Установка не выполняется.')
+        section('01 / Настройка подключения', 'Домен можно добавить в DNS позже')
         log('  › HTTPS-адрес панели: https://panel.example.com')
         log('  › Домен Caddy / SNI: node.example.com')
         completion(dict(node_name='Node-01', domain='node.example.com',
@@ -1045,7 +1247,9 @@ def main():
         return
     if args.command == 'plan':
         cfg, api, state = configure(args)
-        log(json.dumps(cfg, ensure_ascii=False, indent=2))
+        fields = {'domain', 'node_address', 'node_name', 'country_code', 'profile_name', 'profile_uuid', 'inbound_tags', 'vpn_ports', 'node_port', 'dns_ready', 'tls_ready'}
+        public_cfg = {k: v for k, v in cfg.items() if k in fields}
+        log(json.dumps(public_cfg, ensure_ascii=False, indent=2))
         log('План готов. Изменений сервера и записей панели не выполнено.')
         return
     if os.name != 'posix' or os.geteuid() != 0:
@@ -1065,19 +1269,28 @@ def main():
             data = read_json(path / 'rollback.json')
             if not isinstance(data, dict):
                 raise SetupError('Не найден журнал отката rollback.json.')
+            if not args.non_interactive and not confirm('Откат заменит файлы и может удалить созданную этим запуском ноду.'):
+                log('Откат отменён. Изменений нет.')
+                return
+            if args.non_interactive and not args.yes:
+                raise SetupError('Для неинтерактивного отката необходимо --yes.')
             token = load_token(args, not args.non_interactive)
             rollback(data, API(data['config']['panel_url'], token, os.environ.get('REMNA_PROXY_KEY', '')))
             log('Откат завершён. Установленные системные пакеты оставлены на сервере.')
         else:
             cfg, api, state = configure(args)
+            changed = state and (args.refresh_image or any(cfg.get(k) != state['config'].get(k) for k in ('domain', 'profile_uuid', 'inbound_uuids')))
+            if changed and not args.yes:
+                if args.non_interactive or not confirm('Изменятся параметры существующей ноды; возможен перерыв соединений.'):
+                    raise SetupError('Обновление не подтверждено. Для автоматизации используйте --yes.')
             install(cfg, api, state)
 
 
 if __name__ == '__main__':
     try:
         main()
-    except (SetupError, OSError, subprocess.TimeoutExpired, ValueError) as exc:
-        log('ОШИБКА: ' + safe(exc))
+    except (SetupError, OSError, subprocess.TimeoutExpired, ValueError, EOFError) as exc:
+        log('ОШИБКА: ' + ('Превышено время ожидания команды. Проверьте сеть/службу и повторите запуск.' if isinstance(exc, subprocess.TimeoutExpired) else safe(exc)))
         sys.exit(1)
     except KeyboardInterrupt:
         log('Остановлено пользователем.')

@@ -8,7 +8,9 @@
 
 ```bash
 python -m unittest discover -s tests -v
-bash -n install.sh run.sh
+shellcheck install.sh run.sh controller-install.sh bootstrap-deps.sh
+ruff check --no-cache --select E9,F63,F7,F82 setup.py controller.py remote_worker.py tests
+bash -n install.sh run.sh controller-install.sh bootstrap-deps.sh
 python tools/checksums.py
 python tools/checksums.py --check
 python tools/check_public_files.py
@@ -23,3 +25,7 @@ git diff --check
 GitHub Actions не устанавливает ноду и не обращается к боевой панели. Интеграционные
 проверки публичного ACME и реальной ноды требуют отдельного тестового сервера и домена.
 Контракты API: https://docs.rw/api/ .
+
+Тесты tests/test_ux.py используют только временные файлы, имитацию API и локальные
+процессы. На сервере с рабочими нодами запускайте их в отдельном контейнере без сети
+и монтируйте только исходники, без Docker socket, /opt/remnanode и настроек панели.
