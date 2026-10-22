@@ -5,7 +5,7 @@ import json
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -13,6 +13,11 @@ import controller as c
 
 
 class ControllerTests(unittest.TestCase):
+    def test_menu_reprompts_invalid_choice_and_allows_exit(self):
+        with patch.object(c, 'input', side_effect=['invalid', '0'], create=True) as ask:
+            self.assertEqual(c.menu(), '0')
+            self.assertEqual(ask.call_count, 2)
+
     def test_broker_denies_arbitrary_urls_and_other_resources(self):
         api = Mock()
         for method, path in [('GET', 'https://other.test'), ('GET', '/api/users'),
