@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = '1.2.1'
+VERSION = '1.2.2'
 HERE = Path(__file__).resolve().parent
 ROOT = Path('/opt/remna-auto')
 STACK = Path('/opt/remnanode')
@@ -87,7 +87,9 @@ def banner():
 
 
 def completion(cfg, connected):
-    section('✓ Нода готова к работе', 'RemnaNode + Caddy установлены')
+    section('✓ Нода установлена', 'RemnaNode + Caddy установлены')
+    if cfg.get('tls_ready') is False:
+        log('  HTTPS: ожидает сертификата. Selfsteal через этот Caddy заработает после выпуска.')
     for label, value in [('Нода', cfg['node_name']), ('Сайт', 'https://' + cfg['domain']),
                          ('Профиль', cfg['profile_name']),
                          ('VPN-порты', ', '.join(map(str, cfg['vpn_ports']))),
@@ -364,8 +366,16 @@ def caddyfile(domain):
 
 def resolve(host):
     try:
-        return {str(ipaddress.ip_address(x[4][0])) for x in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)}
-    except socket.gaierror:
+        return {str(ipaddress.ip_address(host))}
+    except ValueError:
+        pass
+    worker = ("import socket,json,sys; print(json.dumps(list({x[4][0] for x in "
+              "socket.getaddrinfo(sys.argv[1],None,type=socket.SOCK_STREAM)})))")
+    try:
+        result = subprocess.run([sys.executable, '-c', worker, host], capture_output=True,
+                                text=True, timeout=4, check=True)
+        return {str(ipaddress.ip_address(ip)) for ip in json.loads(result.stdout)}
+    except (OSError, ValueError, subprocess.SubprocessError):
         raise SetupError(f'Не удалось разрешить DNS: {host}') from None
 
 
@@ -450,31 +460,65 @@ def automatic_name(base, nodes, own_uuid=None):
     return f'{base} {number}'[:30]
 
 
+def external_ipv4():
+    for url in ('https://api.ipify.org', 'https://ipv4.icanhazip.com'):
+        try:
+            result = subprocess.run(['curl', '-4', '--noproxy', '*', '-fsS',
+                '--connect-timeout', '2', '--max-time', '3', '--max-filesize', '128', url],
+                capture_output=True, text=True, timeout=4, check=True)
+            ip = ipaddress.IPv4Address(result.stdout.strip())
+            if ip.is_global:
+                return str(ip)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+    return None
+
+
 def detect_ipv4(domain):
-    """Use this host's public IPv4; DNS can identify a public NAT address."""
-    addresses = local_ips()
-    public = sorted(ip for ip in addresses
-                    if ipaddress.ip_address(ip).version == 4 and ipaddress.ip_address(ip).is_global)
-    dns = sorted(ip for ip in resolve(validate_domain(domain))
-                 if ipaddress.ip_address(ip).version == 4 and ipaddress.ip_address(ip).is_global)
-    matching = sorted(set(public) & set(dns))
-    if matching:
-        return matching[0]
+    """Domain DNS is optional; prefer a local public address, then route/echo APIs."""
+    try:
+        public = sorted(ip for ip in local_ips()
+                        if ipaddress.ip_address(ip).version == 4 and ipaddress.ip_address(ip).is_global)
+    except (SetupError, OSError, ValueError):
+        public = []
     if len(public) == 1:
         return public[0]
-    if len(dns) == 1:
+    try:
+        dns = sorted(ip for ip in resolve(validate_domain(domain))
+                     if ipaddress.ip_address(ip).version == 4 and ipaddress.ip_address(ip).is_global)
+    except SetupError:
+        dns = []
+    matching = sorted(set(public) & set(dns))
+    if len(matching) == 1:
+        return matching[0]
+    try:
+        route = json.loads(run(['ip', '-j', '-4', 'route', 'get', '192.0.2.1'], timeout=4).stdout)
+        source = str(ipaddress.IPv4Address(route[0].get('prefsrc', '')))
+        if source in public:
+            return source
+    except (SetupError, OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+        pass
+    address = external_ipv4()
+    if address:
+        return address
+    if not public and len(dns) == 1:
         return dns[0]
-    raise SetupError('Не удалось однозначно определить IPv4 ноды. Настройте одну A-запись домена на этот сервер.')
+    raise SetupError('Не удалось определить публичный IPv4. Укажите node_address в JSON; DNS домена не обязателен.')
 
 
 def check_dns(cfg):
-    ips = resolve(cfg['domain'])
-    local = local_ips()
-    expected = resolve(cfg['node_address'])
-    if not (ips & expected & local):
-        raise SetupError('DNS домена не указывает на IP этой машины. Проверьте A/AAAA и отключите CDN-проксирование.')
-    if not ips.issubset(local):
-        raise SetupError('У домена есть A/AAAA на другой сервер. Исправьте DNS перед выпуском сертификата.')
+    try:
+        ips = resolve(cfg['domain'])
+        expected = resolve(cfg['node_address'])
+        local = local_ips() | expected
+        ready = bool(ips & expected) and ips.issubset(local)
+    except (SetupError, OSError):
+        ready = False
+    cfg['dns_ready'] = ready
+    if not ready:
+        log('Внимание: DNS отсутствует, недоступен или указывает на другой сервер. '
+            'Установка ноды продолжается по IPv4; Caddy получит сертификат после исправления DNS.')
+    return ready
 
 
 def occupied(port, protocol):
@@ -933,7 +977,15 @@ def install(cfg, api, state):
         enable_bbr(tx)
         prepare_local(cfg, secret, tx)
         section('06 / Проверка соединения', 'HTTPS-сертификат, сайт и связь с панелью')
-        verify_tls(cfg['domain'])
+        cfg['tls_ready'] = False
+        if cfg.get('dns_ready', True):
+            try:
+                verify_tls(cfg['domain'])
+                cfg['tls_ready'] = True
+            except SetupError:
+                log('Внимание: HTTPS пока не готов. Caddy продолжит выпуск сертификата автоматически.')
+        else:
+            log('HTTPS отложен до появления DNS. RemnaNode устанавливается независимо.')
         node_uuid = register_node(api, cfg, state, tx)
         log('Запись ноды создана/обновлена. Проверка соединения с панелью…')
         node = wait_connected(api, node_uuid)

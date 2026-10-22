@@ -142,10 +142,12 @@ def deploy(args):
     password = None
     remote = '/tmp/remna-controller-' + uuid.uuid4().hex
     prefix = '' if user == 'root' else 'sudo -n '
+    streams = []
     try:
         # Root or passwordless sudo required; no saved sudo passwords.
         command = prefix + "sh -c 'test $(id -u) = 0 && (command -v python3 >/dev/null || (apt-get update && apt-get install -y python3 ca-certificates))'"
-        _, out, _ = client.exec_command(command, timeout=300)
+        check_in, out, check_err = client.exec_command(command, timeout=300)
+        streams.extend([check_in, out, check_err])
         # Drain output without displaying package errors containing private configuration.
         out.read()
         if out.channel.recv_exit_status():
@@ -158,6 +160,7 @@ def deploy(args):
             ftp.chmod(remote + '/' + name, 0o600)
         ftp.close()
         stdin, stdout, stderr = client.exec_command(prefix + 'python3 -u ' + shlex.quote(remote + '/remote_worker.py'), timeout=2400)
+        streams.extend([stdin, stdout, stderr])
         stdin.write(json.dumps({'domain': domain, 'address': host,
                                'profile_uuid': profiles[index]['uuid'], 'plan': args.plan}) + '\n')
         stdin.flush()
@@ -185,10 +188,22 @@ def deploy(args):
         s.section('✓ План проверен' if args.plan else '✓ Удалённая установка завершена',
                   'API-ключ и настоящий адрес панели остались на управляющем сервере')
     finally:
-        # Only this invocation's exact random directory; no user paths in shell commands.
+        # Close ChannelFiles before the transport: avoids Paramiko finalizer tracebacks.
+        for stream in streams:
+            try:
+                stream.close()
+            except Exception:
+                pass
         try:
-            _, out, _ = client.exec_command(prefix + 'rm -rf -- ' + shlex.quote(remote), timeout=15)
-            out.channel.recv_exit_status()
+            cleanup_in, cleanup_out, cleanup_err = client.exec_command(
+                prefix + 'rm -rf -- ' + shlex.quote(remote), timeout=15)
+            try:
+                cleanup_out.channel.recv_exit_status()
+            finally:
+                for stream in (cleanup_in, cleanup_out, cleanup_err):
+                    stream.close()
+        except Exception:
+            s.log('Внимание: временную папку удалённого запуска не удалось очистить.')
         finally:
             client.close()
 
@@ -202,18 +217,29 @@ def main():
         raise s.SetupError('Центральный установщик запускается от root.')
     s.banner()
     s.log(s.color('  Не рекомендуется размещать на сервере с панелью. Используйте отдельный сервер.', '33'))
-    if args.command is None:
-        choice = menu()
-        if choice == '0':
+    while True:
+        if args.command is None:
+            choice = menu()
+            if choice == '0':
+                return
+            args.command = 'init' if choice == '3' else 'deploy'
+            args.plan = args.plan or choice == '2'
+        try:
+            if args.command == 'deploy' and not (HOME / 'settings.json').exists():
+                initialize()
+            if args.command == 'init':
+                initialize()
+            else:
+                deploy(args)
+        except Exception as exc:
+            if not sys.stdin.isatty():
+                raise
+            s.log('ОШИБКА: ' + s.safe(str(exc)))
+        if not sys.stdin.isatty():
             return
-        args.command = 'init' if choice == '3' else 'deploy'
-        args.plan = args.plan or choice == '2'
-    if args.command == 'deploy' and not (HOME / 'settings.json').exists():
-        initialize()
-    if args.command == 'init':
-        initialize()
-    else:
-        deploy(args)
+        args.command = None
+        args.plan = False
+
 
 
 if __name__ == '__main__':

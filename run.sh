@@ -11,15 +11,15 @@ if [[ $# -eq 0 ]]; then
     if [[ -t 1 && ${TERM:-dumb} != dumb && ! ${NO_COLOR+x} ]]; then
         CYAN=$'\033[1;36m' PINK=$'\033[1;35m' RESET=$'\033[0m'
     fi
-    printf '\n%s  remna %s<3%s\n\n' "$CYAN" "$PINK" "$RESET"
-    printf '  1. Центральный установщик — установка нод по SSH\n'
-    printf '  2. Установить ноду на текущий сервер\n'
-    printf '  0. Выход\n\n'
     while true; do
+        printf '\n%s  remna %s<3%s\n\n' "$CYAN" "$PINK" "$RESET"
+        printf '  1. Центральный установщик — установка нод по SSH\n'
+        printf '  2. Установить ноду на текущий сервер\n'
+        printf '  0. Выход\n\n'
         read -r -p '  Выберите режим [1/2/0]: ' MODE || exit 1
         case "$MODE" in
-            1) set -- controller; break ;;
-            2) set -- install; break ;;
+            1) if ! bash "$BASE/run.sh" controller; then echo '  Действие завершилось с ошибкой. Возврат в меню.'; fi ;;
+            2) if ! bash "$BASE/run.sh" install; then echo '  Действие завершилось с ошибкой. Возврат в меню.'; fi ;;
             0) exit 0 ;;
             *) echo '  Введите 1, 2 или 0.' ;;
         esac
