@@ -328,7 +328,14 @@ def validate_port(value):
 
 
 def validate_config(cfg):
+    if not isinstance(cfg, dict):
+        raise SetupError('config.json должен содержать JSON-объект с параметрами.')
     cfg = dict(cfg)
+    for key in ('panel_url', 'domain', 'node_address', 'node_name', 'country_code', 'node_image'):
+        if key in cfg and not isinstance(cfg[key], str):
+            raise SetupError('Поле ' + key + ' должно быть строкой.')
+    if any(key in cfg for key in ('api_key', 'token', 'password', 'ssh_password', 'proxy_key')):
+        raise SetupError('Не храните секреты в config.json. Используйте скрытый ввод, REMNA_API_KEY или --api-key-file.')
     cfg['panel_url'] = validate_panel_url(cfg.get('panel_url', ''))
     cfg['domain'] = validate_domain(cfg.get('domain', ''))
     address = cfg.get('node_address', '').strip()
@@ -1240,7 +1247,8 @@ def main():
         return
     if args.command == 'plan':
         cfg, api, state = configure(args)
-        public_cfg = {k: v for k, v in cfg.items() if k != 'panel_url'}
+        fields = {'domain', 'node_address', 'node_name', 'country_code', 'profile_name', 'profile_uuid', 'inbound_tags', 'vpn_ports', 'node_port', 'dns_ready', 'tls_ready'}
+        public_cfg = {k: v for k, v in cfg.items() if k in fields}
         log(json.dumps(public_cfg, ensure_ascii=False, indent=2))
         log('План готов. Изменений сервера и записей панели не выполнено.')
         return

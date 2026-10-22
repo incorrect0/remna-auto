@@ -89,7 +89,7 @@ def settings():
     if path.is_symlink():
         raise s.SetupError('Конфиг не должен быть символической ссылкой.')
     cfg = s.read_json(path)
-    if not isinstance(cfg, dict) or not isinstance(cfg.get('api_key'), str) or not cfg['api_key']:
+    if not isinstance(cfg, dict) or not isinstance(cfg.get('api_key'), str) or not cfg['api_key'] or not isinstance(cfg.get('panel_url'), str) or not isinstance(cfg.get('proxy_key', ''), str):
         raise s.SetupError('Конфиг панели повреждён. Запустите remna-controller init.')
     s.validate_panel_url(cfg.get('panel_url', ''))
     s.SECRETS.extend([cfg['panel_url'], cfg['api_key'], cfg.get('proxy_key', '')])
