@@ -4,6 +4,7 @@ import sys
 import json
 import subprocess
 import tempfile
+import os
 import unittest
 from unittest.mock import Mock, patch
 
@@ -13,10 +14,58 @@ import controller as c
 
 
 class ControllerTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'posix', 'PTY menu tests require POSIX')
+    def test_local_launcher_returns_to_menu_after_success_and_failure(self):
+        import pty
+        for result_code in (0, 1):
+            with self.subTest(result_code=result_code), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                # Fixture bypasses the real root check and runs no installer commands.
+                source = (ROOT / 'run.sh').read_text().replace('${EUID}', '0')
+                (root / 'run.sh').write_text(source)
+                (root / 'setup.py').write_text("print('FAKE_NODE_FINISHED'); raise SystemExit(" + str(result_code) + ")")
+                master, slave = pty.openpty()
+                try:
+                    process = subprocess.Popen(['bash', str(root / 'run.sh')], stdin=slave,
+                                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                    os.write(master, b'2\n0\n')
+                    output = process.communicate(timeout=10)[0].decode()
+                    self.assertEqual(process.returncode, 0, output)
+                    self.assertIn('FAKE_NODE_FINISHED', output)
+                    self.assertGreaterEqual(output.count('Установить ноду на текущий сервер'), 2)
+                finally:
+                    os.close(master)
+                    os.close(slave)
+
     def test_menu_reprompts_invalid_choice_and_allows_exit(self):
         with patch.object(c, 'input', side_effect=['invalid', '0'], create=True) as ask:
             self.assertEqual(c.menu(), '0')
             self.assertEqual(ask.call_count, 2)
+
+    def test_success_returns_to_menu(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / 'settings.json').write_text('{}')
+            with patch.object(c, 'HOME', Path(folder)), \
+                 patch.object(c.os, 'geteuid', return_value=0, create=True), \
+                 patch.object(c.sys, 'argv', ['controller.py']), \
+                 patch.object(c.sys.stdin, 'isatty', return_value=True), \
+                 patch.object(c, 'menu', side_effect=['1', '0']) as menu, \
+                 patch.object(c, 'deploy') as deploy:
+                c.main()
+                self.assertEqual(menu.call_count, 2)
+                deploy.assert_called_once()
+
+    def test_failure_returns_to_menu(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / 'settings.json').write_text('{}')
+            with patch.object(c, 'HOME', Path(folder)), \
+                 patch.object(c.os, 'geteuid', return_value=0, create=True), \
+                 patch.object(c.sys, 'argv', ['controller.py']), \
+                 patch.object(c.sys.stdin, 'isatty', return_value=True), \
+                 patch.object(c, 'menu', side_effect=['1', '0']) as menu, \
+                 patch.object(c, 'deploy', side_effect=c.s.SetupError('test failure')):
+                c.main()
+                self.assertEqual(menu.call_count, 2)
 
     def test_broker_denies_arbitrary_urls_and_other_resources(self):
         api = Mock()

@@ -178,18 +178,31 @@ class ValidationTests(unittest.TestCase):
         self.assertNotIn('panel_ips', actual)
 
     @patch.object(s.ipaddress.IPv4Address, 'is_global', new_callable=PropertyMock, return_value=True)
-    def test_ipv4_detection_prefers_local_dns_match(self, _global):
-        with patch.object(s, 'local_ips', return_value={'203.0.113.12', '2001:db8::1'}), \
-             patch.object(s, 'resolve', return_value={'203.0.113.12'}):
+    def test_ipv4_local_without_dns(self, _global):
+        with patch.object(s, 'local_ips', return_value={'203.0.113.12'}), \
+             patch.object(s, 'resolve', side_effect=s.SetupError('no DNS')) as dns:
+            self.assertEqual(s.detect_ipv4('node.example.com'), '203.0.113.12')
+            dns.assert_not_called()
+
+    @patch.object(s.ipaddress.IPv4Address, 'is_global', new_callable=PropertyMock, return_value=True)
+    def test_ipv4_external_without_domain_dns(self, _global):
+        with patch.object(s, 'local_ips', return_value=set()), \
+             patch.object(s, 'resolve', side_effect=s.SetupError('no DNS')), \
+             patch.object(s, 'run', side_effect=s.SetupError('no route')), \
+             patch.object(s, 'external_ipv4', return_value='203.0.113.12'):
             self.assertEqual(s.detect_ipv4('node.example.com'), '203.0.113.12')
 
     @patch.object(s.ipaddress.IPv4Address, 'is_global', new_callable=PropertyMock, return_value=True)
     def test_ipv4_detection_dns_fallback_and_ambiguity(self, _global):
         with patch.object(s, 'local_ips', return_value=set()), \
-             patch.object(s, 'resolve', return_value={'203.0.113.12'}):
+             patch.object(s, 'resolve', return_value={'203.0.113.12'}), \
+             patch.object(s, 'run', side_effect=s.SetupError('no route')), \
+             patch.object(s, 'external_ipv4', return_value=None):
             self.assertEqual(s.detect_ipv4('node.example.com'), '203.0.113.12')
         with patch.object(s, 'local_ips', return_value=set()), \
-             patch.object(s, 'resolve', return_value=set()), self.assertRaises(s.SetupError):
+             patch.object(s, 'resolve', return_value=set()), \
+             patch.object(s, 'run', side_effect=s.SetupError('no route')), \
+             patch.object(s, 'external_ipv4', return_value=None), self.assertRaises(s.SetupError):
             s.detect_ipv4('node.example.com')
 
     def test_only_official_images(self):
@@ -248,11 +261,18 @@ class ValidationTests(unittest.TestCase):
             if os.name == 'posix':
                 self.assertEqual(p.stat().st_mode & 0o777, 0o600)
 
-    def test_nonspecific_dns_and_wrong_aaaa_rejected(self):
+    def test_wrong_dns_defers_https(self):
         c = config()
         with patch.object(s, 'resolve', side_effect=[{'203.0.113.12', '2001:db8::99'}, {'203.0.113.12'}]), \
-             patch.object(s, 'local_ips', return_value={'203.0.113.12'}), self.assertRaises(s.SetupError):
-            s.check_dns(c)
+             patch.object(s, 'local_ips', return_value={'203.0.113.12'}):
+            self.assertFalse(s.check_dns(c))
+            self.assertFalse(c['dns_ready'])
+
+    def test_missing_dns_defers_https(self):
+        c = config()
+        with patch.object(s, 'resolve', side_effect=s.SetupError('no DNS')):
+            self.assertFalse(s.check_dns(c))
+            self.assertFalse(c['dns_ready'])
 
     @unittest.skipUnless(os.name == 'posix', 'POSIX file modes')
     def test_public_site_readable_under_private_umask(self):
@@ -273,7 +293,7 @@ class ValidationTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
-    def test_successful_install_writes_state_without_api_key(self):
+    def test_install_without_dns_preserves_node_and_skips_tls(self):
         api=FakeAPI();original=api.request
         def request(method,path,body=None):
             if path=='/api/keygen':return {'secretKey':'NODE_SECRET_ONLY'}
@@ -284,10 +304,12 @@ class LifecycleTests(unittest.TestCase):
             with patch.object(s,'ROOT',root/'owned'),patch.object(s,'BACKUPS',root/'backups'), \
                  patch.object(s,'CADDY',root/'Caddyfile'),patch.object(s,'run',return_value=Mock(returncode=1,stdout='')), \
                  patch.object(s,'preflight'),patch.object(s,'install_dependencies'),patch.object(s,'prepare_local'), \
-                 patch.object(s,'verify_tls'),patch.object(s,'wait_connected',return_value={'isConnected':True}):
-                s.install(config(),api,{})
+                 patch.object(s,'verify_tls',side_effect=AssertionError('TLS must not block missing DNS')),patch.object(s,'wait_connected',return_value={'isConnected':True}):
+                cfg=config();cfg['dns_ready']=False
+                s.install(cfg,api,{})
             state=json.loads((root/'owned/state.json').read_text())
             self.assertEqual(state['node_uuid'],NODE)
+            self.assertFalse(state['config']['tls_ready'])
             self.assertNotIn('NODE_SECRET_ONLY',(root/'owned/state.json').read_text())
             self.assertEqual(len(api.nodes),1)
 
