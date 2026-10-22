@@ -20,6 +20,25 @@ HOME = Path('/etc/remna-auto-controller')
 HERE = Path(__file__).resolve().parent
 
 
+def prompt(label, default=''):
+    suffix = ' [' + default + ']' if default else ''
+    value = input(s.color('  › ', '38;5;87') + label + s.color(suffix, '38;5;245') + ': ').strip()
+    return value or default
+
+
+def menu():
+    s.section('Центральный установщик', 'Установка нод по SSH · настройки панели хранятся здесь')
+    s.log('  1. Установить новую ноду')
+    s.log('  2. Проверить план без установки')
+    s.log('  3. Настроить подключение к панели')
+    s.log('  0. Выход')
+    while True:
+        value = prompt('Выберите действие')
+        if value in ('0', '1', '2', '3'):
+            return value
+        s.log('  Введите 1, 2, 3 или 0.')
+
+
 def private_dir():
     HOME.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(HOME, 0o700)
@@ -37,7 +56,8 @@ def settings():
 
 def initialize():
     private_dir()
-    url = s.validate_panel_url(input('HTTPS-адрес панели: ').strip())
+    s.section('Настройки панели', 'Значения сохраняются только на управляющем сервере')
+    url = s.validate_panel_url(prompt('HTTPS-адрес панели'))
     key = getpass.getpass('API-ключ (скрытый ввод): ').strip()
     s.API(url, key).request('GET', '/api/config-profiles')
     s.atomic(HOME / 'settings.json', json.dumps({'panel_url': url, 'api_key': key}))
@@ -99,22 +119,25 @@ def broker_request(api, method, path, body, host):
 def deploy(args):
     cfg = settings()
     api = s.API(cfg['panel_url'], cfg['api_key'], cfg.get('proxy_key', ''))
-    host = str(ipaddress.IPv4Address(input('IPv4 нового сервера: ').strip()))
-    user = input('SSH-пользователь [root]: ').strip() or 'root'
+    s.section('01 / SSH-доступ', 'Пароль и приватный ключ не сохраняются на ноде')
+    host = str(ipaddress.IPv4Address(prompt('IPv4 нового сервера')))
+    user = prompt('SSH-пользователь', 'root')
     if not re.fullmatch('[a-zA-Z_][a-zA-Z0-9_-]{0,31}', user):
         raise s.SetupError('Некорректный SSH-пользователь.')
-    port = s.validate_port(input('SSH-порт [22]: ').strip() or 22)
-    keyfile = input('Путь к SSH-ключу (Enter — пароль): ').strip()
+    port = s.validate_port(prompt('SSH-порт', '22'))
+    keyfile = prompt('Путь к SSH-ключу (Enter — пароль)')
     password = getpass.getpass('Пароль/фраза ключа (скрыто): ') if not keyfile else getpass.getpass('Фраза ключа (Enter — без фразы): ')
     if password:
         s.SECRETS.append(password)
-    domain = s.validate_domain(input('Домен Caddy: ').strip())
+    s.section('02 / Домен и профиль', 'Страна, имя, inbound’ы и BBR настраиваются автоматически')
+    domain = s.validate_domain(prompt('Домен Caddy'))
     profiles = api.request('GET', '/api/config-profiles')['configProfiles']
     for i, profile in enumerate(profiles, 1):
         print(f"{i}. {s.safe(profile['name'])}")
-    index = int(input('Номер профиля: ')) - 1
+    index = int(prompt('Номер профиля')) - 1
     if not 0 <= index < len(profiles):
         raise s.SetupError('Некорректный номер профиля.')
+    s.section('03 / Подключение к серверу', 'Проверка SSH и подготовка удалённого установщика')
     client = connect(host, user, port, password or None, keyfile or None)
     password = None
     remote = '/tmp/remna-controller-' + uuid.uuid4().hex
@@ -159,7 +182,8 @@ def deploy(args):
                 done = True
         if stdout.channel.recv_exit_status() or not done:
             raise s.SetupError('Удалённый процесс завершился без подтверждения. Проверьте состояние ноды.')
-        print('Готово. API-ключ и настоящий адрес панели на ноду не передавались.')
+        s.section('✓ План проверен' if args.plan else '✓ Удалённая установка завершена',
+                  'API-ключ и настоящий адрес панели остались на управляющем сервере')
     finally:
         # Only this invocation's exact random directory; no user paths in shell commands.
         try:
@@ -171,12 +195,21 @@ def deploy(args):
 
 def main():
     parser = argparse.ArgumentParser(description='Remna Auto central SSH controller')
-    parser.add_argument('command', choices=['init', 'deploy'])
+    parser.add_argument('command', nargs='?', choices=['init', 'deploy'])
     parser.add_argument('--plan', action='store_true', help='Проверка без установки ноды')
     args = parser.parse_args()
     if os.geteuid() != 0:
         raise s.SetupError('Центральный установщик запускается от root.')
-    print('Не рекомендуется размещать центральный установщик на сервере с панелью: используйте отдельный сервер.')
+    s.banner()
+    s.log(s.color('  Не рекомендуется размещать на сервере с панелью. Используйте отдельный сервер.', '33'))
+    if args.command is None:
+        choice = menu()
+        if choice == '0':
+            return
+        args.command = 'init' if choice == '3' else 'deploy'
+        args.plan = args.plan or choice == '2'
+    if args.command == 'deploy' and not (HOME / 'settings.json').exists():
+        initialize()
     if args.command == 'init':
         initialize()
     else:
