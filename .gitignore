@@ -13,3 +13,6 @@ backups/
 private/
 dist/
 .DS_Store
+
+settings.json
+known_hosts

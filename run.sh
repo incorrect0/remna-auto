@@ -2,6 +2,9 @@
 set -Eeuo pipefail
 umask 077
 BASE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${1:-}" == controller ]]; then
+    exec bash "$BASE/controller-install.sh"
+fi
 if [[ "${1:-install}" != plan && "${1:-install}" != status && ${EUID} -ne 0 ]]; then
     echo 'Запустите от root: sudo bash install.sh' >&2
     exit 1
